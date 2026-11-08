@@ -1,4 +1,6 @@
-# Uncoil blog publishing
+# Uncoil blog
+
+> This repository holds the Uncoil blog posts. The website [Uncoil-dev/Uncoil](https://github.com/Uncoil-dev/Uncoil) mounts it at `content/blog`. Images live in the website repo under `public/media`.
 
 Blog posts are Markdoc files (`.mdoc`) in this directory. The filename is for authors; the public URL comes from the `slug` frontmatter field.
 
