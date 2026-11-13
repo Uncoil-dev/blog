@@ -3,7 +3,7 @@ title: How to Debug AI Agents in Production
 slug: debug-ai-agents-in-production
 excerpt: An incident-focused workflow for reconstructing failed AI-agent runs, isolating the cause, and shipping safer fixes with the evidence to prove them.
 publishedAt: 2026-08-13T17:45:26.154Z
-updatedAt: 2026-08-13T17:45:26.154Z
+updatedAt: 2026-11-12T00:00:00.000Z
 author: Uncoil Team
 draft: false
 categories:
@@ -12,24 +12,22 @@ tags:
   - debugging
   - AI agents
   - incident response
-relatedPosts: []
+relatedPosts: [ai-agent-observability-complete-guide, ai-agent-monitoring, ai-agent-evaluation-practical-guide]
 heroImage:
-  src: /media/organic-series/debug-ai-agents-in-production.jpg
-  alt: A black computer keyboard beside a developer workspace
-  caption: "Unsplash source: https://unsplash.com/photos/black-computer-keyboard-DuHKoV44prg"
-  card: /media/organic-series/debug-ai-agents-in-production.jpg
-  hero: /media/organic-series/debug-ai-agents-in-production.jpg
-  og: /media/organic-series/debug-ai-agents-in-production.jpg
+  src: /media/debug-ai-agents-in-production-hero.svg
+  alt: "Five connected steps for diagnosing an AI agent incident: stabilize, reconstruct, compare, correct, and verify."
+  card: /media/debug-ai-agents-in-production-hero.svg
+  hero: /media/debug-ai-agents-in-production-hero.svg
+  og: /media/debug-ai-agents-in-production-hero.svg
 seo:
-  metaTitle: "Debug AI agents in production: a 6-step workflow"
-  metaDescription: "How to debug AI agents in production: reconstruct the failed run from its trace, isolate the cause, fix it and prove the fix. A step-by-step incident workflow."
+  metaTitle: "How to Debug AI Agents in Production: 5 Steps"
+  metaDescription: "A five-step AI agent debugging workflow: contain impact, reconstruct the trace, find the cause, verify the fix, and prevent regressions."
   image:
-    src: /media/organic-series/debug-ai-agents-in-production.jpg
-    alt: A black computer keyboard beside a developer workspace
-    caption: "Unsplash source: https://unsplash.com/photos/black-computer-keyboard-DuHKoV44prg"
-    card: /media/organic-series/debug-ai-agents-in-production.jpg
-    hero: /media/organic-series/debug-ai-agents-in-production.jpg
-    og: /media/organic-series/debug-ai-agents-in-production.jpg
+    src: /media/debug-ai-agents-in-production-hero.svg
+    alt: "Five connected steps for diagnosing an AI agent incident: stabilize, reconstruct, compare, correct, and verify."
+    card: /media/debug-ai-agents-in-production-hero.svg
+    hero: /media/debug-ai-agents-in-production-hero.svg
+    og: /media/debug-ai-agents-in-production-hero.svg
 ---
 
 Production debugging starts when the user-visible result is wrong, incomplete, unsafe, or too slow—not when a model request returns an error. The job is to protect users first, reconstruct the path, identify the mechanism, and verify that the fix changes the outcome without creating a new failure.
@@ -82,7 +80,7 @@ Open the parent task, not just the last model response. Preserve the user reques
 
 The [AI agent observability guide](/blog/ai-agent-observability-complete-guide) describes the evidence model. A trace is useful when it shortens the path from user effect to an owned hypothesis; collecting more unstructured logs is not the same as reconstructing a run.
 
-![A developer workspace used to reconstruct an AI agent incident timeline](/media/organic-series/debug-ai-agents-in-production.jpg)
+![Incident path from the user-visible failure through the run, first divergence, mechanism, and verified correction](/media/debug-ai-agents-in-production-investigation-path.svg)
 
 *The first useful debugging artifact is a timeline that connects the user effect to the transition that changed the path.*
 
@@ -125,157 +123,121 @@ After release, watch the signal that exposed the incident for a defined observat
 
 The [AI agent testing guide](/blog/ai-agent-evaluation-practical-guide) explains how to turn the confirmed mechanism into the lowest useful durable test. The best incident review ends with a new test, contract, alert, runbook step, or explicit risk decision.
 
+## 6. Turn the mechanism into a regression case
+
+An incident becomes useful after the immediate correction, when the next change cannot quietly recreate it. Convert the confirmed mechanism into a case that preserves the condition that made the failure possible. Keep the case focused: {% highlight %}one input condition, one expected user outcome, and one observable assertion{% /highlight %}.
+
+| Incident condition | Expected behavior | Evidence to assert |
+| --- | --- | --- |
+| Retrieval returns no applicable policy | Abstain, ask for more information, or route to review | No unsupported commitment appears in the result |
+| Account state is older than the workflow allows | Refresh state before making a decision | The stale timestamp is rejected or refreshed |
+| A write request times out with an unknown result | Reconcile before retrying | The action is not duplicated |
+| A tool returns a partial record | Validate required fields and take a safe fallback | Missing fields cannot pass as a complete result |
+
+The expected behavior should describe {% highlight %}what the user or downstream system is allowed to observe{% /highlight %}. It is rarely useful to require the model to return one exact sentence. For a refusal, assert that the agent does not claim an action succeeded. For a tool call, assert that the arguments satisfy the contract and that authorization was checked. For a cost regression, assert a bounded call count or budget decision rather than a brittle token total.
+
+![Four incident conditions mapped to expected behavior, evidence, and regression checks](/media/debug-ai-agents-in-production-regression-matrix.svg)
+
+### Preserve a fair baseline
+
+Save the input class, relevant source or state version, prompt and model versions, tool contract, and expected outcome. Use stable synthetic identifiers for private data. A case that depends on a moving production record is difficult to reproduce and may expose data that should not be copied into a test set.
+
+Keep the original failing case unchanged. If you later improve the expected behavior or replace the case, record why; otherwise a test can become green simply because the team weakened the expectation. {% highlight %}A passing score should mean that the workflow respected the required boundary{% /highlight %}, not that a judge liked the wording.
+
+> **Regression rule:** Keep one case that reproduces the incident and several neighboring cases that test the same boundary under different conditions.
+
+Neighboring cases matter because a narrow fix can trade one failure for another. A retrieval filter may stop the wrong document but also hide the correct one. A stricter timeout may prevent a long retry loop but increase safe escalations. Include a healthy case, the original failure, and at least one plausible edge case before treating the correction as complete.
+
+## 7. Keep diagnostic evidence useful and safe
+
+Traces can contain prompts, retrieved passages, tool arguments, identifiers, and outputs. They are useful because they preserve context; the same context can create privacy and access risk. Collect only what the investigation needs, restrict who can inspect raw values, and use stable references or synthetic replacements when full payloads are not required.
+
+### Separate evidence from personal data
+
+Start with the minimum fields that explain the decision: operation type, version, status, timing, error category, tool name, selected source identifiers, and the result shape. Add raw input or output only when it changes the diagnosis. Remove credentials and direct identifiers before they leave the system that produced them. Pattern-based redaction is a safety layer, not proof that all sensitive content has been removed.
+
+If the incident requires real customer content, use the approved incident channel and storage location. Do not paste production traces into public tickets, personal notes, or a generic AI chat. Keep the evidence reference in the incident record and limit the copied excerpt to what reviewers need to verify the claim. {% highlight %}Pattern-based redaction is a safety layer, not proof that every sensitive value is gone{% /highlight %}.
+
+### Keep investigation access bounded
+
+Record who can access the evidence, why access is needed, and when the copy should be deleted. A useful retention period follows the investigation and review window; keeping raw payloads indefinitely because they might be useful later increases exposure without improving the current diagnosis. Check the actual route through queues, analytics stores, exports, and backups before describing where evidence resides.
+
+> **Handling note:** Redaction, access control, retention, and deletion are separate controls. Confirm each one for the systems that handled the incident evidence.
+
+{% editorial-panel eyebrow="Evidence boundary" title="A trace is not automatically safe to share." body="Keep only the fields that explain the failure. Replace direct identifiers with stable synthetic values, and confirm the storage and access path before moving evidence to another system." tone="dark" /%}
+
+For a broader view of what the run should contain, see the [AI agent observability guide](/blog/ai-agent-observability-complete-guide). This incident workflow is narrower: it begins with a user-visible failure and ends with a verified correction, while the observability guide covers the ongoing evidence system.
+
+## 8. Roll out the correction without hiding a new failure
+
+Passing the original reproduction is necessary, but it is not enough. The change may alter a neighboring task, slow a common path, raise cost, or move the failure to a downstream tool. Compare the correction with the baseline using the same input classes and inspect both the final outcome and the path that produced it.
+
+| Release stage | What to compare | Continue when | Stop or roll back when |
+| --- | --- | --- | --- |
+| Local or staging replay | Original case and neighboring cases | The mechanism is blocked and expected behavior holds | The trace cannot explain the result or a severe case regresses |
+| Shadow or limited cohort | Failure class, correction rate, latency, cost | No new severe failure appears and the signal is interpretable | The change creates unsafe actions or unexplained cost |
+| Wider release | Same signals against the prior baseline | Outcomes stay within the agreed operating bounds | The original symptom returns or a new boundary is crossed |
+
+{% highlight %}Set the stop condition before rollout{% /highlight %}. “Watch it closely” is not a stop condition. Name the signal, threshold or example that triggers a pause, the person who can act, and the rollback or fallback available. If the sample is too small to support a conclusion, keep exposure limited and say that the evidence is inconclusive.
+
+### Compare like with like
+
+Use the same workflow, release context, and input class where possible. Separate model variation from changes to retrieval, tools, policy, or deployment. If several things changed together, the investigation may not be able to attribute the improvement. That is a reason to limit the claim, not to choose the most convenient explanation.
+
+Track the user outcome beside latency and cost. A correction that prevents a wrong action but doubles time may still be the right trade; a correction that increases abstentions may be safer but create more review work. Make the trade-off visible to the workflow owner before expanding rollout.
+
+{% editorial-panel eyebrow="Release gate" title="Do not promote a fix you cannot stop." body="Before widening exposure, name the signal that would pause the rollout, the owner who will watch it, and the safe fallback. If those are missing, the release is not ready for broader traffic." tone="yellow" /%}
+
+The [AI agent monitoring guide](/blog/ai-agent-monitoring) covers how to turn the signal that exposed an incident into an owned alert. Use that operating view after the fix is released; do not confuse a green deployment with proof that the user-visible failure is gone.
+
+## 9. Leave a handoff another responder can use
+
+A good incident handoff is short enough to scan during the next alert and specific enough to prevent the same investigation from starting over. Separate what the trace shows from what the team believes happened. Record uncertainty and the evidence that would change the conclusion.
+
+| Handoff field | What to write |
+| --- | --- |
+| User impact | Who was affected, what they saw, and whether impact is ongoing |
+| Scope | Workflow, time window, release, and affected cohort |
+| Evidence | Representative run references and the first meaningful divergence |
+| Mechanism | The condition that caused or allowed the failure; label remaining uncertainty |
+| Correction | Code, data, prompt, policy, dependency, or operating change and its owner |
+| Verification | Original and neighboring cases, release stage, signal, and stop condition |
+| Follow-up | Regression case, alert, runbook change, or explicit accepted risk |
+
+Do not turn the report into a transcript archive. Include enough context for an engineer to find the run and understand the decision, then keep sensitive payloads in their approved store. Link the regression case and the rollback plan so the handoff remains actionable after the incident channel is quiet.
+
+### A practical review sequence
+
+Use the final review to ask whether the team protected users, reconstructed the relevant path, identified a mechanism, and verified the correction. Then ask what changed for the person on call: is there a new test, an alert with an owner, an updated tool contract, or a safe fallback? If nothing durable changed, decide whether the issue was isolated or whether the evidence was too weak to justify a broader change.
+
+An incident review is not a performance review. Avoid assigning blame for an outcome that the system made hard to see or recover from. Focus on the missing boundary: an absent freshness check, an ambiguous terminal state, an unbounded retry, an unowned alert, or a release with no comparison case. This keeps the discussion tied to changes the team can make and verify. {% highlight %}Make the system boundary the unit of improvement{% /highlight %}, not the person who happened to notice it.
+
+> **Closure rule:** Close the investigation when impact is contained, the mechanism is evidence-backed or explicitly unresolved, the correction has a verification result, and a named owner has the next action. {% highlight %}Every unresolved item needs an owner and a next review point{% /highlight %}.
+
 ## Operational checklist
 
-- Record impact, owner, start time, and first containment action.
-- Open the parent run and reconstruct the complete timeline.
-- Preserve versions, evidence references, tool outcomes, retries, and user effect.
+- Record user impact, owner, start time, affected workflow, and first containment action.
+- Open the parent run and reconstruct the timeline through the user-visible outcome.
 - Compare with a like-for-like healthy run before changing behavior.
-- State the failure as a mechanism and identify what would falsify it.
+- State the mechanism and what evidence could disprove it.
 - Choose a bounded correction at the responsible boundary.
 - Replay the incident and test neighboring failure paths.
-- Watch the exposing signal with a defined rollback condition.
-- Turn the confirmed mechanism into a durable test or operating control.
+- Turn the confirmed mechanism into a durable regression case or operating control.
+- Set a rollout stop condition, owner, and rollback path.
+- Store only the evidence needed for diagnosis and agree when copies will be deleted.
 
-## Next step: make debugging repeatable
+## Next step: make one failure repeatable
 
-Choose one recent failed run and write its timeline, comparison case, mechanism, correction, and verification signal. Keep the packet short enough for the next responder to use, and turn the confirmed mechanism into one durable test or control before closing the incident.
+Choose one recent failed run. Write the user effect, first divergence, mechanism, correction, and verification signal on a single page. Add the original case and one neighboring case to the test set, then ask another engineer to follow the evidence without you narrating it. If they cannot explain what happened, identify which field, version, or ownership link is missing before expanding instrumentation.
 
-## The debug ai agents in production operating model
-
-## Put debug ai agents in production into practice
-
-A useful article should help a reader move from an idea to a safe production decision. Start by stating the user-visible outcome, then identify the inputs, the owner, the evidence, and the terminal states. Do not begin with a tool or framework. Begin with the decision the system must support and the cost of getting that decision wrong. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Define the contract
-
-Write the input and output contract before tuning the model. Name required fields, acceptable values, missing-data behavior, and the response a user receives when the system cannot proceed. A schema validates shape, but it does not prove meaning or authorization. Follow parsing with semantic checks, policy checks, and an explicit fallback. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Separate proposal from authority
-
-A model can classify, extract, summarize, rank, or propose an action. Deterministic code should own permissions, limits, accounting, retention, and irreversible side effects. This boundary makes the system easier to test and easier to explain after an incident. If a model suggestion is rejected, route it to a visible state instead of silently rewriting it. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Build representative cases
-
-Create a small case set before claiming that an implementation works. Include ordinary examples, empty inputs, ambiguous requests, stale data, conflicting evidence, malformed outputs, permission boundaries, and provider failures. Label the expected user outcome and the unacceptable failure. Keep the cases versioned so a later change can be compared against the same baseline. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Validate the full path
-
-Unit tests are valuable for parsers, transitions, policies, and retry rules, but they do not prove the workflow works end to end. Add scenario tests that exercise retrieval, model calls, tool calls, timeouts, duplicate events, approvals, and partial completion. Preserve the trace for each important scenario and check both the final result and the intermediate evidence. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Make retries safe
-
-Every external write needs a stable identity, a bounded retry policy, and a reconciliation path. A timeout is not proof that an action failed. Record unknown outcomes explicitly, query the provider when possible, and prevent duplicate work with idempotency keys. Never let a generic retry loop decide whether a financial, permission, or communication side effect is safe. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Design human review
-
-Human review should be specific and actionable. Show the proposed action, normalized arguments, evidence, policy version, expected consequence, and expiration. Bind approval to that exact proposal. If a material field changes, invalidate the approval. Record the reviewer, decision, reason, and result so rejection patterns become improvements rather than repeated surprises. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Instrument useful evidence
-
-A trace should connect the original request to each meaningful stage and the final outcome. Capture versions, latency, cost, status, error category, tool arguments after redaction, and the evidence used for the decision. Avoid collecting sensitive payloads merely because they are available. Store references or structured summaries when raw content is not necessary for diagnosis. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Measure outcomes
-
-Completion rate is not enough. Measure correctness, user acceptance, review rate, repair rate, latency, cost, retries, and the frequency of unsafe or unauthorized proposals. Segment the results by version, model, customer cohort, input class, and failure mechanism. A higher automation rate can be a regression when it creates more corrections or delays discovery of mistakes. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Roll out in stages
-
-Use observation, shadow mode, suggestions, prepared drafts, approved execution, and only then broader automation. Give each stage an owner, cohort, success threshold, and rollback condition. Preserve the manual path until the automated path has demonstrated normal and degraded behavior. Keep in-flight work recoverable when a release is paused. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Operate failure states
-
-Make waiting, degraded, unknown, failed, cancelled, and completed distinct states. Tell the user whether the system is waiting for data, approval, a provider, a retry window, or manual repair. Give every waiting state an expiration or escalation path. Silent queues and ambiguous success messages are operational defects, not cosmetic issues. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Review changes
-
-Prompts, models, schemas, retrieval indexes, tools, providers, and policies are all dependencies. Version them and record their versions with each run. When behavior changes, compare a representative cohort with the previous baseline. Review quality, safety, latency, cost, and correction work together; optimizing one dimension can damage another. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Example decision record
-
-For a meaningful release, write a short record with the goal, affected workflow, expected improvement, known risks, evidence set, rollout stage, owner, rollback command, and review date. Link it to representative traces and the test cases that protect the most important boundary. This record turns a vague confidence claim into something another engineer can inspect. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-### Practical checklist
-
-Before launch, confirm that the workflow has a named owner, a clear contract, policy enforcement, safe side effects, representative tests, useful traces, and a recovery path. After launch, sample successful and failed runs, inspect corrections, update the case set, and retire metrics that do not change a decision. The goal is not maximal automation; it is a dependable user outcome that the team can explain and improve. For debug ai agents in production, use this as a concrete review criterion: connect the decision to its evidence, owner, and recovery path.
-
-## Failure scenarios in debug ai agents in production
-
-The happy path is the least informative path. Rehearse empty input, malformed output, stale context, unavailable dependencies, rate limits, duplicate callbacks, and a provider timeout after an external system may already have accepted the request. For each case, state the expected user-visible result, the durable record that proves what happened, and the person or process responsible for recovery.
-
-### A concrete runbook
-
-When an incident starts, identify the affected workflow and version, determine whether the problem is global or cohort-specific, pause new side effects if needed, and preserve a representative trace. Compare a failed run with the last known healthy run. Look for the first meaningful divergence rather than the loudest error. Record the hypothesis, reversible change, verification signal, and owner before editing production behavior.
-
-### Data and permissions
-
-Review every input source for freshness, scope, and authorization. A technically correct answer built from data the user should not see is still a failure. Propagate tenant and user context through retrieval and tools, filter before the model sees data when possible, and avoid treating a model instruction as permission. Test cross-tenant, revoked-access, and stale-credential cases explicitly.
-
-### Cost and capacity
-
-Measure cost per successful outcome, not merely cost per model call. A cheap answer that triggers retries, review, or correction can be more expensive than a larger reliable call. Set token, time, concurrency, and provider budgets. Define what degrades first when capacity is constrained, and ensure that load shedding does not bypass authorization or create untracked work.
-
-### Quality drift
-
-Quality can move when user questions, documents, providers, or model behavior changes. Keep a fixed regression set and a recent production sample. Compare not only averages but severe failures, cohort movement, abstention behavior, and correction work. If the system is uncertain, a safe review or explicit limitation is often preferable to a confident unsupported result.
-
-### Recovery and replay
-
-Replay only when the workflow is designed for it. Separate read-only analysis from side effects, preserve idempotency keys, and mark whether a run was original, retried, reconciled, or replayed. A replay should not silently send a message, charge an account, or change permissions. Provide operators with a dry-run mode and a clear confirmation step for consequential actions.
-
-### What to document
-
-Keep the contract, state machine, dependency versions, permissions, test cases, dashboards, alerts, rollback procedure, and escalation contacts near the workflow. Documentation should answer what the system does, what it cannot do, what evidence it records, and how to stop it safely. Update it after incidents and material changes, not only during an initial launch.
-
-### A review question
-
-Ask: if this workflow is wrong for one customer tomorrow, can the team identify the affected runs, stop further harm, explain the mechanism, recover unknown side effects, and prove the fix? If any answer is no, the next improvement belongs in observability, authorization, state management, testing, or the runbook—not in more persuasive output wording.
-
-### Closing practice
-
-Choose one representative workflow and perform the full exercise this week. Write its contract, rehearse two degraded cases, inspect one trace, measure one user outcome, and name one rollback condition. Keep the result small enough to use. Reliable systems are built through repeated evidence-based decisions, not through a single promise that the model will behave.
-
-## Final review questions
-
-Before treating this guidance as complete, ask what a careful operator would need at the moment the system surprises them. Can they tell which version ran, what evidence was available, which policy applied, and whether an external action is still unknown? Can they stop new work without losing recoverable state? Can they distinguish a model-quality problem from a retrieval problem, a policy problem, a provider problem, or an integration problem? These questions turn a conceptual guide into an operational one.
-
-A useful review compares three runs: one that succeeded cleanly, one that succeeded only after a retry or human correction, and one that failed. Record the timeline, state transitions, inputs, outputs, costs, and user-visible result. The comparison often reveals that the system’s most important missing feature is not another metric but a durable boundary: a missing owner, an ambiguous terminal state, an unlogged approval, an unsafe retry, or an output that was accepted without semantic validation.
-
-Treat the result as a living contract. When a model, prompt, tool, policy, provider, data source, or workflow state changes, update the representative cases and rerun the relevant checks. Keep the old behavior available during staged rollout when the side effects matter. Retire a control only when its replacement covers the same failure and the evidence shows that the new boundary is understood.
-
-The best implementation is usually the smallest one that makes the decision explicit. Prefer a narrow workflow with clear permissions, predictable recovery, and honest uncertainty over a broad agent that can do more but cannot explain what it did. Measure the correction work created for people, not just the work removed from the queue. If the new path saves time while increasing hidden review or incident cost, it has not improved the user outcome.
-
-Use this guide to produce a concrete next action. Pick one workflow, name its owner, write the contract, collect representative traces, choose one quality and one safety signal, and set a rollback condition. Review the result with engineering, security, and the people who handle exceptions. Their questions are part of the system design. A dependable production workflow is not defined by a long prompt or a high demo score; it is defined by a user-visible outcome that remains explainable, bounded, and recoverable as conditions change.
-
-## From debug ai agents in production draft to durable practice
-
-A production article should leave the reader with a sequence they can execute and inspect. Start with a baseline: one representative input, one expected outcome, one failure case, and one trace or record that makes the result visible. Change one meaningful variable at a time. If the result improves, record why; if it regresses, preserve the case so the regression becomes a durable test instead of a forgotten anecdote.
-
-When choosing between alternatives, state the tradeoff plainly. Simpler systems are easier to operate but may provide less coverage. More retrieval, more tools, or more model calls may improve one quality measure while increasing latency, cost, privacy exposure, and failure surface. The right choice depends on the user outcome and the risk budget. A recommendation is only useful when the reader knows when not to use it.
-
-Make uncertainty visible. Use abstention, escalation, citations, confidence bands, or a clear “not enough evidence” state when the workflow cannot support a reliable result. Do not convert missing evidence into confident prose. Define which uncertainties are acceptable, which require human review, and which should stop execution. Then test those boundaries with examples that are deliberately incomplete or adversarial.
-
-Plan ownership beyond launch. Someone should own the workflow contract, dependency updates, dashboards, incident response, and review cadence. The owner should be able to answer how a release is evaluated, how a bad change is rolled back, and how users are informed during degradation. Shared ownership without a named decision-maker usually becomes no ownership when the first failure crosses team boundaries.
-
-Include the maintenance loop in the implementation. Sample production results, inspect correction work, refresh the regression set, review costs and latency, and remove metrics that do not guide action. Feed confirmed incidents into tests, policies, or state transitions. A fix that changes only wording may hide a symptom; a durable fix changes the mechanism that allowed the failure or makes the failure safe and visible.
-
-Finally, define completion precisely. A workflow is not complete because the demo passed or because the model produced a plausible answer. It is complete when its inputs and outputs are bounded, its authority is explicit, its evidence is traceable, its side effects are safe to retry or reconcile, its degraded states are honest, and its owner can prove the result with representative cases. Use that standard to decide what to build next and what to leave out.
-
-## Operating checklist for debug ai agents in production
-
-Use a representative input and a deliberately difficult input. Confirm that the system identifies the workflow and version, applies the right scope and permissions, records the evidence used, and returns a state a user can understand. If it calls a tool, verify the arguments after normalization and confirm that the tool result is associated with the same run. If it retries, verify that the retry is bounded and cannot duplicate a consequential side effect.
-
-Review one success, one corrected result, and one failure after every material release. Compare the first meaningful divergence, not only the final text. Update the regression case, runbook, policy, or state transition that would have prevented the failure or made it safe. Then record the owner and date for the next review. This small discipline keeps the implementation connected to production reality and gives the team evidence for deciding whether to expand, simplify, or pause the workflow.
-
-## Final operator exercise for debug ai agents in production
-
-Take the next real implementation decision and write it down before changing the system. State the user outcome, the acceptable and unacceptable failure, the evidence required, the authority boundary, the owner, and the rollback condition. Run the decision through a small representative set that includes missing data, conflicting evidence, stale context, and a dependency failure. Keep the traces and compare them with the baseline.
-
-After launch, inspect the result from the user’s point of view. Did the workflow produce the promised outcome? Did it create correction work? Was the latency and cost acceptable? Could an operator reconstruct the decision without guessing? If the answer is no, classify the gap and improve the contract, test, policy, trace, or recovery path that owns it. A production guide is successful when it changes what the team can safely explain and operate, not when it merely adds another page of plausible advice.
 ## Frequently asked questions
 
 {% faq-item question="What should an on-call engineer do first?" answer="Protect users and external state with the smallest reversible action: pause, roll back, narrow exposure, or route to a safe fallback. Record the impact and owner, then open the parent run so diagnosis starts from the task rather than the last model response." /%}
 
-{% faq-item question="Is a prompt change always the fix?" answer="No. A wrong result can originate in retrieval, stale state, tool contracts, permissions, retries, validation, dependencies, or the release boundary. Identify the mechanism first; change the prompt only when the evidence shows that instruction or context interpretation is the responsible boundary." /%}
+{% faq-item question="How do I find the root cause of an AI agent failure?" answer="Reconstruct the complete run, compare it with a healthy run from the same workflow, and locate the first meaningful divergence. State the mechanism as a condition that can be checked, then identify what evidence would disprove it." /%}
 
-{% faq-item question="When should a workflow be paused?" answer="Pause when customer harm is active, an irreversible action lacks trustworthy evidence or authority, a policy boundary is violated, or the team cannot establish a safe fallback. Resume only after a named owner records the condition and verification that supports renewed exposure." /%}
+{% faq-item question="Should I change the prompt when an agent gives a wrong answer?" answer="Only when the evidence shows that instructions or context interpretation caused the failure. A wrong result can also come from retrieval, stale state, tool contracts, authorization, retries, validation, or a provider. Fix the responsible boundary." /%}
+
+{% faq-item question="What should an AI agent debugging trace include?" answer="Include a parent run, ordered model and tool steps, relevant versions, timing, errors, the evidence used, and the user-visible outcome. Keep raw inputs limited to what the investigation needs and remove secrets before transmission." /%}
+
+{% faq-item question="How do I know a production fix is safe to release?" answer="Replay the original case, test neighboring cases, compare the same signals against a baseline, and define a stop condition with an owner and rollback path. If the sample is too small or the result is ambiguous, keep exposure limited and report the uncertainty." /%}
