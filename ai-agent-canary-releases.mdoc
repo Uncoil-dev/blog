@@ -1,0 +1,391 @@
+---
+title: "AI Agent Canary Releases: Ship Prompt and Model Changes to a Small Slice First"
+slug: ai-agent-canary-releases
+excerpt: Roll out agent prompt, model, and tool changes to a small, pinned slice of traffic, compare it against the stable arm with pre-set gates, and widen or roll back on evidence.
+publishedAt: 2026-11-20T10:00:00.000Z
+author: Uncoil Team
+draft: true
+categories:
+  - operations
+tags:
+  - canary releases
+  - releases
+  - reliability
+  - AI agents
+relatedPosts:
+  - ai-agent-release-checklist
+  - agent-deployment-rollback-strategies
+  - ai-agent-regression-testing
+heroImage:
+  src: /media/ai-agent-canary-releases-hero.svg
+  alt: A wide stable lane of runs with a thin canary lane branching off toward a gate that decides whether to widen or roll back
+seo:
+  metaTitle: "AI Agent Canary Releases: Slice, Compare, Gate, Widen"
+  metaDescription: Run canary releases for AI agents with pinned traffic slices, comparable trace fields, sample-size math, and pre-set gates that widen or roll back a change.
+---
+
+Most agent changes look safe in a test set and then behave differently on real traffic. A prompt edit that reads better, a cheaper model, a new tool description: each one passes the offline checks and then meets inputs nobody wrote a test for. A canary release limits the damage of that gap. The change serves a small, fixed share of live runs while everything else stays on the stable version, and a pre-agreed comparison decides whether the share grows or the change is pulled. This guide is for engineers who already run an agent in production and need a rollout procedure for prompt, model, and tool changes that produces a decision instead of a hunch.
+
+{% trace-scenario title="Is this canary healthy enough to widen?" prompt="A new prompt serves 5% of runs. After 400 canary runs the error rate matches the stable arm, but the median cost per run is 30% higher and three canary runs hit the step limit that no stable run hit this week. Traffic is steady and the change was meant to improve answer quality, not cost." outcome="Hold the share and do not widen. Cost and step-limit counts are gate dimensions too, and 400 runs cannot yet separate a small error-rate difference from noise. Read the three step-limit traces, decide whether the cost rise is the price of the intended quality gain, and only then continue." /%}
+
+## At a glance
+
+![Four-stage loop of slice, compare, gate, and widen with a rollback branch from the gate](/media/ai-agent-canary-releases-orientation.svg)
+
+The reader is an engineer or on-call owner who ships changes to a live agent. The job is to move a change from "passed offline checks" to "serving everyone" without betting every user on that first pass. The outcome is a rollout that has four properties: the slice is stable and chosen on purpose, both arms are measured with identical fields, the thresholds were written down before the data arrived, and every step up in traffic is a recorded decision that can be reversed.
+
+The boundary is narrow on purpose. This article covers how to expose a new version to a fraction of live runs and how to judge it. It does not replace offline evaluation, which should already have caught what a test set can catch; the [release checklist](/blog/ai-agent-release-checklist) and [regression testing](/blog/ai-agent-regression-testing) cover that ground. It also does not cover the mechanics of reverting a deployment, which [rollback strategies](/blog/agent-deployment-rollback-strategies) treats in depth. A canary is the middle layer: it {% highlight %}turns production traffic into the final test{% /highlight %} while keeping the blast radius small.
+
+### The operating model: slice, compare, gate, widen
+
+The model has four stages that repeat. Slice means choosing which runs see the new version and keeping that choice stable. Compare means measuring the canary arm and the stable arm with the same fields over the same period. Gate means applying thresholds that were fixed before the rollout started. Widen means raising the share one step, or rolling back, and recording which. The loop runs once per step in the traffic ladder, and the rest of the article takes each stage in turn.
+
+| Stage | What you decide | Evidence you need |
+| --- | --- | --- |
+| Slice | Who sees the new version and how that is kept stable | A deterministic bucket and a version label on every run |
+| Compare | Which metrics define "better" and "worse" | Matching fields on both arms over the same window |
+| Gate | What result stops or continues the rollout | Thresholds and a minimum sample written before launch |
+| Widen | How far to go next, or whether to go back | The gate result, traces of outliers, and a named owner |
+
+## Decide what a canary can and cannot tell you
+
+A canary is {% highlight %}evidence from real inputs at small scale{% /highlight %}. That is its strength and its limit. It can tell you that the new prompt produces more tool errors on a class of requests no test covered, or that a model swap lowered cost without changing completion. It cannot tell you about rare events that the slice is too small to contain, and it cannot tell you about effects that only appear at full load, such as provider rate limits that your own traffic share triggers.
+
+### What a slice of live traffic is good at
+
+Three kinds of problem are well suited to canaries. The first is input diversity: real users send phrasings, languages, attachment shapes, and conversation histories that a curated dataset does not include. The second is interaction between components: a prompt change can alter which tool the agent chooses, which changes latency and cost downstream. The third is environmental drift: the dependency your agent calls today is not the one you tested against last month, and a canary exercises the current one.
+
+### What a slice cannot cover
+
+Small slices are blind to rare failures. If a bad behavior affects one run in two thousand, a 5% slice of 20,000 daily runs sees about 1,000 canary runs and has a fair chance of seeing zero examples. Slices are also blind to load-dependent behavior. A canary that serves 5% of traffic will not push a provider toward its rate limit, so the first time you meet that limit may be at 100%. Treat that as a reason to pair the canary with the load-aware steps later in the ladder, not as a reason to skip the canary.
+
+> **Field note:** A canary reduces the chance that a bad change reaches everyone. It does not prove a change is good. Write down which risks the slice can observe and which it cannot, so a clean canary is not mistaken for a clean bill of health.
+
+### Which changes deserve a canary
+
+Not every change needs one. A typo fix in a log message does not. A canary earns its overhead when the change can alter the agent's behavior in ways an offline suite may not predict. Changes to prompts, models, sampling settings, tool schemas, retrieval configuration, and guardrail rules all qualify. Changes to unrelated plumbing usually do not.
+
+| Change type | Canary value | Why |
+| --- | --- | --- |
+| Prompt or system instruction edit | High | Behavior shifts are broad and hard to enumerate offline |
+| Model or provider swap | High | Cost, latency, and tool-call format can all move together |
+| Tool schema or description change | High | Alters tool selection and argument quality |
+| Retrieval or context-window change | Medium to high | Changes what evidence the agent sees |
+| Guardrail or refusal rule change | High | Can block legitimate runs or let unsafe ones through |
+| Pure refactor with identical behavior | Low | Offline equality checks are usually enough |
+
+## Slice the traffic with a stable bucket
+
+The most common canary mistake is routing at random per request. If a user sees the new version on one turn and the stable version on the next, the conversation mixes two behaviors, and neither arm is clean. Choose a unit of assignment that matches what the agent treats as one continuous interaction, then hash it into a bucket so the same unit always lands in the same arm.
+
+### Choose the unit of assignment
+
+For a single-shot task agent, the run is the unit. For a conversational agent, the session or the end user is the better unit, because a prompt change should apply to a whole conversation or not at all. For an agent acting on behalf of an account, the account is often the right unit, since one customer's configuration affects every run they trigger. The decision rule is simple: pick the largest unit that would be confusing to split.
+
+### Hash into a bucket, not a coin flip
+
+A deterministic hash of the unit identifier plus a rollout name gives each unit a number from 0 to 99. A unit is in the canary when its number is below the current share. Because the number does not change, raising the share from 5 to 25 only adds units; it never moves a unit that was already in the canary back to stable. Including the rollout name in the hash means two concurrent canaries do not select the same users every time.
+
+```ts
+// Illustrative: a deterministic bucket for canary assignment.
+import { createHash } from "node:crypto";
+
+export function bucketFor(unitId: string, rollout: string): number {
+  const digest = createHash("sha256").update(`${rollout}:${unitId}`).digest();
+  // Use the first four bytes as an unsigned integer, then map to 0-99.
+  return digest.readUInt32BE(0) % 100;
+}
+
+export function armFor(unitId: string, rollout: string, sharePercent: number): "canary" | "stable" {
+  if (!Number.isFinite(sharePercent) || sharePercent <= 0) return "stable";
+  return bucketFor(unitId, rollout) < Math.min(sharePercent, 100) ? "canary" : "stable";
+}
+```
+
+The function has two failure behaviors worth noting. An invalid share falls back to stable, so a configuration mistake cannot accidentally send everyone to the new version. And because the bucket depends only on the unit and the rollout name, the same unit gets the same answer on every server, with no shared state to keep in sync.
+
+### Pin the version for the lifetime of the run
+
+Choose the arm once, at the start of the run, and carry it through every step. If a long-running agent re-reads the share mid-run, a widen step could switch a run from stable to canary halfway through its tool calls. Capture the version at the start and pass it down, so each run is one version from first step to last.
+
+> **Operating note:** Pin on the run, bucket on the session or user. The run records which version served it; the bucket decides which version the next run will use. Mixing the two is how partially migrated conversations appear in the canary data.
+
+## Label every run so the arms stay comparable
+
+A comparison is only as honest as its labels. If canary runs carry a version tag and stable runs do not, or if the tags are applied after the fact from deploy logs, the arms will drift apart in ways that confound the result. Tag both arms at the moment the run starts, with the same fields, so a query can split them without joining against another system.
+
+### Fields that make the comparison possible
+
+The comparison needs a version label, an environment label, and a rollout identifier on every run, plus the outcome fields you will gate on. The [trace schema guide](/blog/ai-agent-trace-schema) covers what a trace should capture in general; for a canary the minimum is a short list. Uncoil's TypeScript SDK client accepts `release`, `environment`, `deploymentId`, and `tags` in its configuration and copies them onto the spans it records, and span data carries `latencyMs`, `costUsd`, `inputTokens`, `outputTokens`, `errorType`, and `retryCount`. Those are the fields the gates below rely on.
+
+| Field | Role in the canary | Example value |
+| --- | --- | --- |
+| `release` | Names the version that served the run | `prompt-v14` or a commit hash |
+| `environment` | Separates production from other traffic | `production` |
+| `tags` | Carries the rollout name and arm | `["canary-q4-summary", "arm:canary"]` |
+| `costUsd` | Gates on spend per run | `0.0187` |
+| `latencyMs` | Gates on speed | `5230` |
+| `errorType` | Splits failures by cause | `tool_timeout` |
+| `retryCount` | Reveals hidden instability | `2` |
+
+### Configure the client per arm
+
+Because release and tags are set on the client, the simplest pattern is to build one client per arm and select it when the run starts. The arm decision, the version label, and the tags then travel together and cannot disagree.
+
+```ts
+// Illustrative: one client per arm so labels cannot drift from routing.
+import { UncoilClient } from "@uncoil.dev/sdk";
+
+const rollout = "canary-q4-summary";
+
+const clients = {
+  stable: new UncoilClient({
+    release: "prompt-v13",
+    environment: "production",
+    tags: [rollout, "arm:stable"],
+  }),
+  canary: new UncoilClient({
+    release: "prompt-v14",
+    environment: "production",
+    tags: [rollout, "arm:canary"],
+  }),
+};
+
+export function clientForRun(sessionId: string, sharePercent: number) {
+  const arm = armFor(sessionId, rollout, sharePercent);
+  return { arm, client: clients[arm] };
+}
+```
+
+The code assumes the bucket helper from the previous section and the client options named in the SDK's configuration type. Treat the version strings as placeholders; the important property is that the label and the routing come from the same decision.
+
+### Keep non-version differences out of the comparison
+
+An honest canary changes one thing. If the canary arm also runs on a different region, a different cache, or a different set of users, a difference in the results cannot be attributed to the change. Check that the two arms see the same request mix by comparing simple properties such as input length, language, and task type across both. If the mix differs, the comparison needs stratifying or the bucket needs fixing before the result means anything.
+
+> **Field note:** A canary arm that quietly serves a different population is the agent-release version of a biased experiment. When a gate fails or passes by a suspiciously wide margin, check the request mix before trusting the number.
+
+## Choose gates before you see the data
+
+A gate is a threshold plus a sample size plus an action. The discipline that makes canaries useful is {% highlight %}writing these down before the first canary run exists{% /highlight %}. Thresholds chosen after looking at the data drift toward whatever the data says, and a rollout nobody can fail is a deploy with extra steps.
+
+### Pick a small set of gate metrics
+
+Use a handful of metrics that map to user and operator harm, and keep them few enough that each one gets read. A reasonable starting set is the run failure rate, the step-limit or loop-exit rate, median and tail latency, cost per run, and one quality signal that matches what the change was meant to improve. The [SLO and error budget framework](/blog/ai-agent-slos-error-budgets) is a good source for which of these already have agreed targets; reuse those targets instead of inventing canary-only numbers.
+
+| Gate metric | Compare against | Typical action on breach |
+| --- | --- | --- |
+| Run failure rate | Stable arm, same window | Hold, then roll back if it persists |
+| Step-limit or loop-exit rate | Stable arm | Hold and read the traces |
+| p95 latency | Stable arm and the latency target | Hold if above target |
+| Median cost per run | Stable arm and the cost budget | Hold unless the rise is the intended trade |
+| Quality signal (score or feedback) | Stable arm | Roll back if worse beyond the margin |
+
+### Set an absolute margin, not just a relative one
+
+A relative threshold such as "no worse than 10% above stable" behaves badly at low base rates. If the stable failure rate is 0.5%, a 10% margin is 0.05 percentage points, which no practical sample can resolve. Use an absolute margin in percentage points for rates, and a relative margin for continuous measures like cost and latency. State both the margin and the direction: a cost decrease should not trip a gate that exists to catch cost increases.
+
+### Decide what counts as a roll back and what counts as a hold
+
+Not every breach justifies removing the change. A hard breach, such as a failure rate beyond the margin with enough runs to be credible, or any occurrence of a safety-relevant failure, triggers an immediate roll back. A soft breach, such as a cost rise or an inconclusive result, triggers a hold: the share stays where it is, and someone reads traces before the next step. Writing the distinction down keeps the on-call engineer from improvising at the worst moment.
+
+{% editorial-panel eyebrow="Gate rule" title="Write the failing condition before the rollout, not after the first bad chart." body="A gate names the metric, the comparison arm, the margin, the minimum number of canary runs, and the action. If any of the five is missing, the gate cannot say no, and the rollout is a deploy in slow motion." tone="yellow" /%}
+
+## Size the sample so the gate can say something
+
+A gate that fires on thirty runs is mostly measuring luck. The question that decides how long each step must last is how many canary runs it takes to distinguish a real difference from noise, and the answer depends on the base rate and on how small a difference you care about.
+
+### A rule of thumb for rates
+
+For a failure rate near a base value `p`, a common approximation for the runs needed in each arm to detect an absolute difference `d` with about 80% power at a 5% significance level is `n ≈ 16 × p × (1 − p) / d²`. It is an approximation, not a substitute for a proper power analysis, but it is good enough to plan a rollout and to explain why a short step proves little.
+
+| Base failure rate | Difference to detect | Approx. runs per arm |
+| --- | --- | --- |
+| 4% | 2 percentage points | about 1,500 |
+| 4% | 1 percentage point | about 6,100 |
+| 10% | 3 percentage points | about 1,600 |
+| 1% | 0.5 percentage points | about 6,300 |
+
+The table is arithmetic from the formula above, not a measurement from any system. It shows the useful pattern: halving the difference you want to detect {% highlight %}roughly quadruples the runs you need{% /highlight %}.
+
+### Turn sample size into a step duration
+
+Divide the runs you need by the canary arm's daily volume. With 20,000 runs a day and a 5% canary, the canary arm gets about 1,000 runs a day, so detecting a 2-point change from a 4% base needs roughly a day and a half. At 20% the same evidence arrives in about half a day. This is why the traffic ladder starts small to limit harm and then climbs quickly: the early steps look for catastrophic problems that show up in tens of runs, and the later steps gather the volume needed for subtle ones.
+
+```ts
+// Illustrative: estimate how long a canary step must run.
+export function runsNeededPerArm(baseRate: number, minDetectableDiff: number): number {
+  if (baseRate <= 0 || baseRate >= 1 || minDetectableDiff <= 0) return Infinity;
+  return Math.ceil((16 * baseRate * (1 - baseRate)) / (minDetectableDiff ** 2));
+}
+
+export function hoursForStep(
+  dailyRuns: number,
+  sharePercent: number,
+  baseRate: number,
+  minDetectableDiff: number,
+): number {
+  const canaryRunsPerHour = (dailyRuns * (sharePercent / 100)) / 24;
+  if (canaryRunsPerHour <= 0) return Infinity;
+  return runsNeededPerArm(baseRate, minDetectableDiff) / canaryRunsPerHour;
+}
+
+// hoursForStep(20000, 5, 0.04, 0.02) is about 37 hours.
+```
+
+The helper returns infinity for degenerate inputs so a mistaken configuration shows up as an impossible plan rather than as a quiet zero.
+
+> **Decision rule:** If the hours for a step exceed the time you are willing to hold a change at partial rollout, either raise the share or accept a larger detectable difference. Do not shorten the step and keep the same claim of confidence.
+
+## Climb a traffic ladder with a hold at each rung
+
+A ladder is a short list of shares, each with a purpose. The first rung is about safety, not statistics. The later rungs are about evidence and about load.
+
+### A workable ladder
+
+One reasonable ladder for a high-volume agent is 1%, 5%, 25%, 50%, and 100%, with a hold at each. The 1% rung exists to catch crashes, malformed tool calls, and obvious loops with a handful of runs. The 5% rung begins to gather evidence on rates. The 25% rung gives enough volume to resolve smaller differences. The 50% rung is where load-dependent behavior, such as rate-limit pressure and cache effects, begins to show. The last rung is the full rollout, which you keep reversible by leaving the stable version deployable for a defined period.
+
+| Rung | Primary purpose | Typical hold |
+| --- | --- | --- |
+| 1% | Catch crashes, loops, and malformed outputs | Until a few dozen runs complete |
+| 5% | Start comparing failure and step-limit rates | Hours to a day, volume permitting |
+| 25% | Resolve smaller differences in rates and cost | A day |
+| 50% | Expose load, cache, and rate-limit effects | A day, including a peak period |
+| 100% | Full rollout with stable kept ready | Keep stable deployable for a set period |
+
+### Low-volume agents need a different shape
+
+If an agent handles a few hundred runs a day, a 1% slice has nothing in it for days. Skip the tiny rungs, start at a larger share for a defined internal or low-stakes population, and lean harder on offline evaluation and shadow comparison. A shadow run executes the new version on a copy of the input without returning its result to the user, which gives you comparison data with no user exposure at the cost of extra compute and the need to suppress side effects.
+
+### Treat side effects as a separate risk
+
+Agents that send email, write records, or call paid tools make a canary riskier than it looks, because a wrong action cannot be unsent. Do not shadow-run side-effecting steps unless they are mocked or disabled in the shadow path. For canary arms that do act, constrain the first rungs to populations where a mistake is cheap and recoverable, and make sure the approval and permission controls are at least as strict as the stable arm's.
+
+## Read the first divergence in the traces
+
+When a gate trips, the dashboard number tells you something is wrong and the traces tell you what. Resist the urge to debate the metric; open the canary runs that failed or exceeded the budget and compare them to stable runs on similar inputs. The goal is the first step where the two versions diverge.
+
+### Compare like with like
+
+Pick a failed canary run and find a stable run with a similar input, then walk both traces from the start. The first meaningful difference might be a different tool chosen, an extra retry, a longer context, or a refusal. That first divergence usually names the cause far faster than the aggregate numbers do. The [debugging guide for production agents](/blog/debug-ai-agents-in-production) walks through reading traces in that order.
+
+### Separate cause from consequence
+
+A canary arm with a higher failure rate may fail because of the change or because of something correlated with it. Check whether the failures cluster on a single tool, a single input type, or a single time window. A cluster on one tool suggests the tool description or schema change is at fault. A cluster in one time window suggests a dependency incident that happened to hit the canary. A spread across everything suggests the change itself.
+
+{% editorial-panel eyebrow="Diagnostic shortcut" title="Find the first step where canary and stable disagree." body="Read one failing canary trace beside a similar stable trace and stop at the first differing step. That step, not the final error, is where the fix belongs." tone="dark" /%}
+
+## Compare the trade-offs honestly
+
+Canary results rarely move every metric the same way. A change that improves answer quality may cost more. A cheaper model may be slightly slower. The point of pre-set gates is to decide those trade-offs on purpose, with the cost of each side visible, rather than after someone has fallen in love with the new version.
+
+### Quality, cost, latency, and risk
+
+Treat the gate metrics as a vector, not a score. Collapsing them into a single composite hides the case where quality rose and a safety measure regressed. Where a trade is intended, state it before the rollout: for example, "cost per run may rise up to 25% if the quality score improves by at least two points". If the result lands inside that envelope, widen. If it lands outside, hold or roll back.
+
+| Observation | Weak reading | Better reading |
+| --- | --- | --- |
+| Failure rate equal, cost up 30% | No problem, errors are flat | Check whether quality rose enough to justify the spend |
+| Failure rate down, p95 latency up | Net improvement | Check whether the latency target is still met |
+| Quality up, step-limit hits up | Quality wins | Inspect loops; a few runs may be burning budget |
+| All metrics equal | The change is neutral | Confirm the sample was large enough to see a difference |
+
+### Watch the cost tail, not only the median
+
+Median cost can stay flat while a small fraction of runs becomes much more expensive, for example when a prompt change causes occasional long loops. Compare a high percentile of cost per run, or the share of runs above a cost ceiling, alongside the median. The [cost attribution guide](/blog/ai-agent-cost-attribution) explains how to assign spend to runs so that those tails are visible.
+
+> **Decision rule:** A gate that watches only the median will miss a change that is fine for most runs and ruinous for a few. Gate on a tail measure for any metric with a long tail, especially cost and latency.
+
+## Protect the security and data boundary
+
+A canary is a production path, so every control that applies to the stable arm applies to the canary arm, and some apply more strongly. The canary version has had less real-world exposure, which makes it the more likely place for an unexpected behavior to appear.
+
+### Keep permissions identical or tighter
+
+The canary arm should not hold broader credentials, wider tool access, or looser approval rules than stable. If the change adds a tool, that tool is a new capability and deserves its own review before any traffic reaches it. Least privilege is a property of the version, not of the rollout, so confirm it before the first rung.
+
+### Do not log what you would not log elsewhere
+
+Both arms should apply the same redaction and retention rules. Uncoil's SDK redacts secrets before data leaves the application and masks common personal data by default, and it exposes a `redact` option for additional clean-up; confirm those settings are the same in both client configurations rather than assuming it. A canary that logs raw inputs because someone turned off redaction for debugging has turned a rollout into a data exposure.
+
+### Make the kill switch independent of the new version
+
+The mechanism that sends traffic back to stable must not depend on the canary version working. If the routing decision lives inside the new prompt or the new service, a failure in that code can disable the way out. Put the share control in configuration that you can change without deploying the version under test, and rehearse using it before the rollout needs it.
+
+## Read the lower half visually
+
+![Chart of canary and stable error rates over three traffic steps with a gate threshold that the canary crosses after the third step](/media/ai-agent-canary-releases-decision.svg)
+
+The chart above is illustrative, not data from a real system. It shows the shape of the problem a canary exists to catch: the two arms track each other at low volume, then the canary line separates as the share grows and the sample becomes large enough to see the difference. {% highlight %}A breach at a later rung is expected, not a failure of the process{% /highlight %}; it is the process doing its job at the point where the evidence became sufficient.
+
+### Why the breach appears late
+
+Small samples hide small differences. At 1% the two lines sit within noise of each other, so a real but modest regression looks like nothing. As the share rises, noise shrinks and the gap becomes visible. If your gates only evaluate at the earliest rung, you will pass changes that a later rung would have caught. Keep evaluating at every rung, and keep the thresholds fixed so a late breach cannot be explained away.
+
+### What to do when the breach is ambiguous
+
+Sometimes the canary line sits just above the threshold with a sample that is still too small to be sure. The safest ambiguous response is to hold the share, extend the step to gather the runs the sample-size estimate called for, and read the traces in the meantime. Widening on an ambiguous result trades a small certain delay for a possible large regression.
+
+### Recognize when the canary is the wrong tool
+
+If the change has no observable user-facing difference, a canary adds cost for no information. If the agent's volume is too low to produce a useful comparison, use offline evaluation and shadow runs instead. If a failure would be severe and irreversible even at tiny scale, such as a financial action, do not use live traffic as the test; require a staging path with human review first.
+
+## Work a full rollout from slice to decision
+
+Take a support-summary agent that handles about 20,000 runs a day, with a stable failure rate near 4% and a median cost per run that the team tracks. The change under test is a rewritten system prompt, labeled `prompt-v14`, meant to improve how often summaries include the customer's stated deadline.
+
+### Before the first rung
+
+The team writes the gates. Run failure rate must not exceed stable by more than 1 percentage point once at least 1,500 canary runs exist. Step-limit exits must not exceed stable by more than 0.5 percentage points. Median cost per run may rise by up to 15%. The quality signal, whether the summary contains the deadline when one exists, must improve by at least three points. Any safety-relevant failure triggers an immediate rollback. These numbers are placeholders for the example; each team should derive its own from its SLOs.
+
+### At 1% and 5%
+
+At 1%, about 200 canary runs a day complete with no crashes or malformed outputs, so the team moves to 5%. After a day at 5%, 1,000 canary runs have completed and the failure rate matches stable within noise. The sample is still short of 1,500, so the gate cannot yet pass, and the team holds. The quality signal looks better, but three canary runs exited on the step limit and no stable run did.
+
+### The ambiguous middle
+
+A hold is {% highlight %}the right call{% /highlight %}. The team opens the three step-limit traces and finds a pattern: when a customer message contains two deadlines, the new prompt asks the retrieval tool to confirm each one, loops, and runs out of steps. The cost rise of 12% is explained by those loops. The change is fixable, so the team does not widen; it patches the prompt, labels the fix `prompt-v15`, and restarts the ladder at 5% with the same gates.
+
+| Observation at 5% | Weak interpretation | Better next move |
+| --- | --- | --- |
+| Failure rate equal at 1,000 runs | Safe to widen | Hold until the planned 1,500 runs exist |
+| Three step-limit exits, none in stable | Random noise | Read the traces; look for a shared input pattern |
+| Cost up 12%, quality up | Accept the trade | Confirm the cost is not loop-driven before accepting |
+
+### The decision
+
+The restarted rollout at 5% completes with step-limit exits matching stable, cost up 6%, and the quality signal up by four points. The failure rate difference is within the 1-point margin with 1,600 runs per arm. The team widens to 25%, then 50% through a peak period, and finally to 100%, keeping `prompt-v13` deployable for one more week. The decision at each rung is recorded with its gate result and an owner.
+
+{% editorial-panel eyebrow="Decision room" title="A canary that finds a fixable bug has paid for itself." body="The most valuable outcome of this rollout was not the widen decision. It was the hold at 5% that exposed a loop the offline set never contained, at the cost of a handful of runs." tone="paper" /%}
+
+## Make the operating decision
+
+A rollout that works once becomes a process only when {% highlight %}it is boring to repeat{% /highlight %}. The pieces that make it boring are the same each time: a stable bucket, matching labels on both arms, gates written first, a ladder with holds, and a recorded decision at each rung. The [release checklist](/blog/ai-agent-release-checklist) is the right place to anchor the pre-canary steps, and a team that already tracks [drift](/blog/ai-agent-drift-detection) can reuse those signals as canary gates, since a change that causes drift is exactly what a canary should catch early.
+
+### Who owns each decision
+
+Name an owner for the rollout, an owner who can roll back without asking permission, and a reviewer who reads the traces when a gate holds. Without those names, a hold turns into a thread where everyone waits for someone else. The rollback owner needs access to the share control and the authority to use it at any hour that the rollout is live.
+
+### Record the rollout, not just the result
+
+Keep a short log per rollout: the version, the rollout name, the gates, the ladder with dates, the gate result at each rung, and the final decision. That log is the input to the next canary, because it tells the next engineer what a normal rollout of this agent looks like, which gates were useful, and which tripped for reasons that turned out to be noise. For prompt changes in particular, the [prompt versioning guide](/blog/prompt-versioning-and-prompt-management) explains how to keep versions identifiable so the log can point at something exact.
+
+## Leave the reader with the next move
+
+- [ ] The unit of assignment is chosen and hashed into a stable bucket with an invalid share falling back to stable.
+- [ ] Both arms are tagged with release, environment, and rollout at the start of each run.
+- [ ] Gates name the metric, comparison arm, margin, minimum runs, and action, and were written before launch.
+- [ ] The step durations come from a sample-size estimate, not from impatience.
+- [ ] Permissions, redaction, and retention are identical or tighter for the canary arm.
+- [ ] The share control is independent of the version under test and has been rehearsed.
+- [ ] Each rung records its gate result, an owner, and the decision.
+
+Start with the next prompt or model change you plan to ship. Before touching traffic, write the five-part gate for failure rate and one cost or latency measure, add the two labels to your client configuration, and set the share to a value you can change without a deploy. Run the first rung against a population where a mistake is cheap, and let the gate, not the calendar, decide when to widen.
+
+## Frequently asked questions
+
+{% faq-item question="How is a canary release different from an A/B test?" answer="Both split traffic, but the purpose differs. A canary exists to limit harm while checking that a change is safe to ship, so it uses a small share, pre-set safety gates, and an easy rollback. An A/B test measures which of two acceptable options is better on a chosen outcome and usually runs a fixed, balanced split to a planned sample size. Agent teams often use a canary first and an A/B comparison later if the safe change needs a quality verdict." /%}
+{% faq-item question="What share of traffic should the first rung use?" answer="Pick the smallest share that still produces a few dozen runs in a reasonable time, since the first rung looks for crashes, loops, and malformed outputs rather than subtle rate changes. For a high-volume agent that is often one percent. For a low-volume agent a one percent slice may hold almost nothing, so start larger on a low-stakes population and rely more on offline evaluation and shadow runs." /%}
+{% faq-item question="How many canary runs do we need before trusting a failure rate?" answer="It depends on the base rate and the difference you care about. A rough approximation is sixteen times the base rate times one minus the base rate, divided by the square of the difference, per arm. Detecting a two point change from a four percent base needs roughly fifteen hundred runs in each arm. Treat that as a planning figure and use a proper power analysis when the decision is costly." /%}
+{% faq-item question="Can we canary a change that has side effects such as sending messages or writing records?" answer="Be careful. A wrong action cannot be unsent, so restrict early rungs to populations where mistakes are cheap and recoverable, keep approval rules at least as strict as the stable arm, and do not run side-effecting steps in a shadow path unless they are mocked or disabled. If a failure would be severe and irreversible even at small scale, use a staging path with human review instead of live traffic." /%}
+{% faq-item question="When should we roll back instead of holding the share?" answer="Roll back when a hard gate is breached with enough runs to be credible, or when any safety-relevant failure appears. Hold when the result is inconclusive or a soft metric such as cost has moved: keep the share where it is, extend the step to reach the planned sample, and read the traces. Writing this distinction down before the rollout keeps the decision calm when it matters." /%}
