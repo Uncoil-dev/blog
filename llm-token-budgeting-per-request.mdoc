@@ -1,0 +1,374 @@
+---
+title: "LLM Token Budgeting Per Request: Set, Enforce and Review a Cap"
+slug: llm-token-budgeting-per-request
+excerpt: Give every model call an explicit token budget, split it across prompt sections, trim in a fixed order, and decide in advance what happens when a request does not fit.
+publishedAt: 2026-11-20T12:00:00.000Z
+author: Uncoil Team
+draft: true
+categories: [operations]
+tags: [token budget, LLM cost, context window, AI agents]
+relatedPosts: [how-to-track-llm-token-usage, context-window-management, reduce-llm-costs-without-hurting-quality]
+heroImage:
+  src: /media/llm-token-budgeting-per-request-hero.svg
+  alt: A cream ledger card with a fixed token allowance divided into labeled lines and a yellow reserve line for the model's answer
+seo:
+  metaTitle: "LLM Token Budgeting Per Request: Set, Enforce and Review a Cap"
+  metaDescription: Learn how to set a token budget for each model call, split it across prompt sections, trim in a safe order, and review the cap using traces instead of guesses.
+---
+
+{% trace-scenario title="The request that does not fit" prompt="A support agent builds a prompt of 9,400 tokens, but the cap for this request type is 8,000. The system prompt and tool definitions are fixed. History and retrieved passages can shrink. What do you cut first?" outcome="Cut the section with the weakest link to the current question, which is usually the oldest history turns or the lowest-ranked retrieved passages, and keep the fixed instructions untouched. Record what was cut. If the fixed parts plus the minimum for each trimmable part still exceed the cap, reject the request rather than send a prompt that has lost its instructions." /%}
+
+## At a glance
+
+![A request budget drawn as one bar: fixed instructions, tool definitions, history, retrieved passages, the user message, and a reserved block for the answer](/media/llm-token-budgeting-per-request-orientation.svg)
+
+*A per-request budget is a plan made before the call. The bar is allocated line by line, and the answer's share is reserved first so it cannot be squeezed out later.*
+
+This guide is for engineers who run an LLM feature or an agent in production and have noticed that cost and latency are decided by whatever the prompt builder happens to assemble. The job is to replace that accident with a decision. The outcome is a budget you can state in one sentence per request type, enforce in code before the call, and revise using evidence from traces.
+
+The boundary matters. This article is about the size of a single request: how many tokens go in, how many may come out, and what happens when the plan does not fit. It does not cover monthly spend forecasting, vendor pricing negotiation, or the choice between models. For measurement, the companion piece on [how to track LLM token usage per request, run and release](/blog/how-to-track-llm-token-usage) explains where counts come from and how to record them. Here we assume you can measure and ask what to do with the numbers.
+
+The core idea is that a token budget is a contract between the parts of your system. {% highlight %}Every section of the prompt gets an allowance, and the allowance is enforced before the call, not discovered on the invoice.{% /highlight %}
+
+### The operating model: Reserve, Allocate, Trim, Escalate
+
+The article uses one four-step model, and every later section hangs from it.
+
+1. **Reserve.** Decide the output allowance first and subtract it from what the context window and your own cap allow. Input gets what is left.
+2. **Allocate.** Split the remaining input into named lines: instructions, tool definitions, history, retrieved passages, tool results and the user message. Each line has a target and a floor.
+3. **Trim.** If the assembled prompt exceeds the ceiling, shrink lines in a fixed, documented order, never below their floor.
+4. **Escalate.** If trimming to the floors still does not fit, do something explicit: reject, route to a larger window, summarize, or ask the user to narrow the request.
+
+| Step | Question it answers | Evidence you need | Failure if skipped |
+| --- | --- | --- | --- |
+| Reserve | How much room does the answer need? | Distribution of output lengths per request type | Answers cut off mid-sentence or invalid structured output |
+| Allocate | Who is allowed to use how much? | Per-section token counts from traces | One section silently crowds out the rest |
+| Trim | What do we give up first? | Which context actually changed answers | Random truncation drops the instruction that mattered |
+| Escalate | What if nothing fits? | The floor of every section and a fallback path | Over-limit errors surface as user-facing failures |
+
+## Why a cap per request, not just a monthly budget
+
+A monthly spend alarm tells you that something went wrong after the damage is done. It does not tell you which request type, which prompt section or which release is responsible, and it cannot stop a single runaway request from consuming a large amount in one go. A per-request budget fixes the unit of control at the same level where the cost is actually created: one call, one prompt, one answer.
+
+There are three distinct reasons to cap individual requests, and they are worth separating because they lead to different numbers.
+
+### Cost is a product of two things you control
+
+Input tokens and output tokens are usually priced differently, and the ratio is provider specific, so read your own provider's current price sheet instead of trusting a rule of thumb. What stays true everywhere is the structure: request cost is input tokens multiplied by the input rate, plus output tokens multiplied by the output rate. A budget controls both factors. Capping input protects you from bloated context. Capping output protects you from verbose or looping answers.
+
+### Latency follows size
+
+Larger prompts take longer to process before the first token appears, and longer answers take longer to stream. A user-facing chat feature with a latency target needs a budget that is derived from that target, not only from price. If the p95 latency target is tight, the input budget may be much smaller than the model's context window would allow. The article on [LLM latency optimization](/blog/llm-latency-optimization) covers the timing side in detail; the budget is the lever that connects it to your prompt builder.
+
+### Quality degrades before the window is full
+
+A model with a large window can accept a very long prompt, but accepting is not the same as using it well. Long, noisy context can bury the instruction or the one relevant passage. A cap forces the question of which context earns its place. {% highlight %}Treat the model's published window as a hard ceiling, never as a target.{% /highlight %} Your cap should sit below it, set by evidence about what the request type needs.
+
+> **Field note:** The context window is a limit on what the model can accept. A budget is a statement about what the task needs. The first is fixed by the vendor; the second is a decision you own and should be able to defend with traces.
+
+## Reserve: protect the answer first
+
+The most common budgeting mistake is to fill the window with input and hope the answer fits in what is left. Output tokens count against the same window, so a prompt that uses almost all of the window leaves almost nothing for the answer. The result is a truncated response, and with structured output, truncated JSON that fails to parse.
+
+### Choose the output allowance from observed lengths
+
+Do not guess the output allowance. Pull the distribution of completion tokens for each request type from your traces. Set the reserve near a high percentile of normal answers, then add a small margin. A reserve based on the average will truncate roughly half of your long answers. A reserve equal to the full window defeats the point of the budget.
+
+If you do not yet have per-request-type distributions, start with a conservative reserve, record the finish reason on every call, and revisit it after a week of traffic. A finish reason that says the model hit the length limit is direct evidence that the reserve is too small for that request type.
+
+### Separate the reserve from the hidden output
+
+Some models spend tokens on internal reasoning before the visible answer, and those tokens may be billed and counted against the output limit. Check how your model and provider report them. If reasoning tokens share the output limit, the visible answer needs a larger reserve than its text length suggests. Record the reported reasoning token count as its own field so that it does not hide inside the output total.
+
+### The arithmetic of a reserve
+
+For a request type with a model window of 32,000 tokens, a reserve of 1,500 tokens for the answer and a team cap of 9,000 tokens for the whole input, the input ceiling is the smaller of two numbers: the window minus the reserve (30,500) and the team cap (9,000). The team cap wins. This is why the code later in the article takes the minimum of the two rather than assuming the window is the binding limit.
+
+## Allocate: give every section a name, a target and a floor
+
+A budget with one number is not enforceable. If all you know is that the prompt should be under 9,000 tokens, you cannot tell which part to shrink when it is not. Allocation turns the ceiling into lines.
+
+### The six lines of an input
+
+Most agent and chat prompts are built from the same parts. The earlier article on token usage names six sources, and they make a good starting set of budget lines.
+
+| Line | Typical behavior over a run | Trimmable? | Budget guidance |
+| --- | --- | --- | --- |
+| System instructions | Fixed per release | No | Count once, keep stable, review at each prompt change |
+| Tool definitions | Fixed per agent configuration | Rarely | Send only the tools the step can use |
+| Conversation history | Grows each turn | Yes | Largest line to cap, with a floor for recent turns |
+| Retrieved passages | Varies by query | Yes | Cap by count and by tokens, keep highest ranked |
+| Tool results | Varies by tool | Yes | Truncate or summarize, keep identifiers |
+| User message | Set by the user | No, but can be limited upstream | Reject or ask to narrow when extreme |
+
+Fixed lines are cheap to reason about: measure them at build time and put the number in the budget. Variable lines are where the control happens, so they need both a target (what you aim for) and a floor (the least you will accept before the request is no longer sensible).
+
+### Targets and floors are different numbers
+
+A target is the size you plan for under normal conditions. A floor is the smallest size at which that section still does its job. History might have a target of 3,000 tokens and a floor of 800, which is roughly the last few turns. Retrieved passages might have a target of 3,000 tokens and a floor of 600, which is the top couple of passages. The distance between target and floor is the slack that trimming can use. If the sum of all floors is larger than the ceiling, the configuration is impossible and should fail at review time, not at request time.
+
+### Use the cheapest accurate counter you have
+
+Counting tokens exactly requires the tokenizer for the target model. Where an exact count is available from the provider or a local tokenizer, use it. Where it is not, use an estimate that errs on the high side and calibrate it against the usage numbers reported by the provider after each call. An estimate that is consistently ten percent low will cause occasional over-limit rejections, while a slightly high one wastes a small amount of room. Record both the estimate and the reported value so that the error is visible in your traces.
+
+{% editorial-panel eyebrow="Operating principle" title="Every line needs a target and a floor." body="A target says what normal looks like. A floor says when a section stops being useful. Trimming moves a line from its target toward its floor, never below it. If all floors together exceed the ceiling, change the design, not the trimmer." tone="yellow" /%}
+
+## Trim: shrink in a fixed order, and record what you removed
+
+When the assembled prompt is over the ceiling, trimming decides what the model never sees. This is a quality decision disguised as a size problem, so it needs an order that someone chose on purpose.
+
+### A defensible trim order
+
+Start from the section whose marginal token is least likely to change the answer.
+
+1. **Tool results that were already used.** If the model has already acted on a large tool output, replace it with a short summary and the identifiers needed to refetch it.
+2. **Lowest-ranked retrieved passages.** Drop whole passages from the bottom of the ranking rather than cutting passages in half.
+3. **Oldest history turns.** Keep the most recent turns verbatim. Consider replacing older turns with a short running summary.
+4. **Optional examples and style guidance.** If your prompt has few-shot examples, drop them last among the soft parts, because they often carry format requirements.
+5. **Never trim:** system instructions, safety rules, the current user message and the definitions of tools the step may call.
+
+This order is a starting hypothesis, not a law. The point is that it is written down, so a change in order is a reviewed change. The detailed techniques for each line, including summarization and sliding windows, are in the guide to [context window management](/blog/context-window-management).
+
+### Trim whole units, not arbitrary characters
+
+Cutting a passage mid-sentence produces text that reads as authoritative but is missing its qualification. Dropping a half of a JSON tool result produces invalid structure the model may try to repair by guessing. Prefer removing complete units: whole passages, whole turns, whole list items. Where a unit is too large to keep or drop, summarize it explicitly and mark it as summarized.
+
+### Record every cut
+
+A trim that leaves no trace is a debugging trap. When a user reports a wrong answer, the first question is whether the relevant context was in the prompt. Attach to the span for the call the sizes before and after trimming for each line and the units removed. If you use Uncoil traces, these fit as attributes on the model-call span next to the token counts, so that a bad run can be inspected for what was dropped without reconstructing it from logs.
+
+> **Decision rule:** If more than a small fraction of requests in a type are being trimmed on a routine basis, the target for that type is wrong. {% highlight %}Trimming is a safety valve, not the normal path.{% /highlight %} Raise the cap, shrink the sources upstream, or split the task.
+
+### A worked example in code
+
+The following is an illustrative budget planner in TypeScript. It is deliberately small. It takes a list of named sections with a current size, a floor and a flag saying whether it may be trimmed, computes the ceiling from the window, the reserve and the team cap, and returns one of three verdicts. It was run with the demo values below before publication, and the output is shown after the code.
+
+```ts
+type Section = { name: string; tokens: number; minTokens: number; trimmable: boolean };
+type Plan = {
+  sections: Section[];
+  total: number;
+  outputReserve: number;
+  verdict: "fit" | "trimmed" | "reject";
+};
+
+export function planRequest(
+  sections: Section[],
+  contextLimit: number,
+  outputReserve: number,
+  softCap: number,
+): Plan {
+  const ceiling = Math.min(contextLimit - outputReserve, softCap);
+  const copy = sections.map((s) => ({ ...s }));
+  let total = copy.reduce((sum, s) => sum + s.tokens, 0);
+  if (total <= ceiling) return { sections: copy, total, outputReserve, verdict: "fit" };
+
+  for (const s of copy.filter((x) => x.trimmable)) {
+    const give = Math.min(total - ceiling, s.tokens - s.minTokens);
+    if (give > 0) {
+      s.tokens -= give;
+      total -= give;
+    }
+    if (total <= ceiling) break;
+  }
+  return { sections: copy, total, outputReserve, verdict: total <= ceiling ? "trimmed" : "reject" };
+}
+
+const demo: Section[] = [
+  { name: "system", tokens: 900, minTokens: 900, trimmable: false },
+  { name: "tools", tokens: 1400, minTokens: 1400, trimmable: false },
+  { name: "history", tokens: 5200, minTokens: 800, trimmable: true },
+  { name: "retrieved", tokens: 3000, minTokens: 600, trimmable: true },
+  { name: "user", tokens: 300, minTokens: 300, trimmable: false },
+];
+
+console.log(planRequest(demo, 32000, 1500, 9000).verdict); // trimmed, total 9000
+console.log(planRequest(demo, 32000, 1500, 3000).verdict); // reject
+```
+
+With a window of 32,000, a reserve of 1,500 and a cap of 9,000, the demo prompt totals 10,800 tokens, so it is over the ceiling by 1,800. The planner takes those 1,800 from history first, which leaves history at 3,400 and the total at exactly 9,000. With a cap of 3,000, the floors alone add up to 4,000 (900 plus 1,400 plus 800 plus 600 plus 300), so no amount of trimming helps and the verdict is reject.
+
+What the code does not do is worth stating. It does not count tokens, it assumes the order of the array is the trim order, and it trims a single section to its floor before touching the next. A real implementation would add per-unit trimming, summarization and logging. The shape, however, is the point: the decision is made in one function that is easy to test.
+
+## Escalate: decide what happens when nothing fits
+
+Reject, route, summarize or ask. Those are the four honest answers when the floors exceed the ceiling, and each has a cost.
+
+### Four escalation paths
+
+| Path | When it fits | Cost | Risk |
+| --- | --- | --- | --- |
+| Reject with a clear message | The request is outside the product's intended scope | None beyond the lost request | User frustration if the limit is unexplained |
+| Route to a larger window or model | The task genuinely needs the context | Higher price and latency for that request | Cost creep if routing becomes the default |
+| Summarize and retry | Content is long but compressible | One extra model call | Summary loses detail the answer needed |
+| Ask the user to narrow the request | The input is ambiguous or sprawling | One extra turn | Drop-off in conversational flows |
+
+Pick the path per request type and write it next to the budget. Routing deserves particular caution because it can silently turn a cap into a suggestion. If you route over-budget requests to a more expensive model, track the share of requests that take that path and put a limit on it. The article on [LLM gateway model routing](/blog/llm-gateway-model-routing) discusses how routing rules are structured and where they can go wrong.
+
+### Fail early, and fail where it is cheap
+
+{% highlight %}Check the budget before the call, in the same process that builds the prompt.{% /highlight %} An over-limit error returned by the provider costs a round trip and, in some cases, does not give you the information to fix it. A local check is deterministic and free. It also gives you a single place to emit a structured event with the request type, the sizes of each line and the verdict.
+
+## Enforce: where the cap lives in the stack
+
+A budget that exists only in a design document is not enforced. There are three places to put the check, and they work best in combination.
+
+### Layered enforcement
+
+1. **In the prompt builder.** The planner above runs here. It knows the sections and can trim intelligently. This is the primary control.
+2. **At the gateway or client wrapper.** A thin layer that sets the output token limit parameter on every call, refuses calls above a hard maximum, and tags each call with a request type. It is the safety net for code paths that bypass the builder.
+3. **In the agent loop.** For multi-step agents, a per-run budget caps the total across steps. Each step draws from it, and the loop stops or escalates when it is exhausted. This is what prevents a retry loop from turning into a large bill.
+
+The first layer produces quality. The second layer produces safety. The third layer produces bounded cost for runs with many calls. The article on [AI agent cost attribution](/blog/ai-agent-cost-attribution) shows how to attribute spend to the run, tool and release that created it, which is the data you need to set the per-run number honestly.
+
+### Set the output limit on every call
+
+{% highlight %}Always pass an explicit maximum for output tokens.{% /highlight %} Without one, you are relying on a provider default, which may be far higher than your reserve and may change. Set the parameter from your reserve and treat a length-limited finish reason as a signal worth alerting on, not as a normal completion.
+
+### Keep the budget in configuration, with an owner
+
+Store the numbers in version-controlled configuration keyed by request type, not as constants scattered through code. Each entry has the ceiling, the reserve, the per-section targets and floors, the trim order and the escalation path. Give each entry an owner who is expected to review it when the prompt, the model or the traffic mix changes. A budget that nobody owns drifts toward the highest number anyone ever needed.
+
+> **Operating note:** Treat a change to a budget entry like a change to a prompt. It should be reviewed, versioned and tied to a release, so a later cost or quality shift can be traced to the change that caused it.
+
+## Per-run budgets for agents
+
+Agents differ from single calls in one important way: the number of calls is not fixed. A per-request cap alone does not bound a run that takes many steps, and the history line grows each step, so later calls are larger than earlier ones.
+
+### The shape of a run's cost
+
+In an agent loop, each step re-sends the instructions, the tool definitions and the growing history. If the history grows by roughly the same amount each step, the total input across the run grows faster than linearly with the number of steps, because every earlier step is repeated inside each later one. That is why a run with twice as many steps can cost noticeably more than twice as much, and why an unbounded loop is so expensive.
+
+### Two numbers per run
+
+Set a maximum number of steps and a maximum total token count for the run. The step limit catches loops that repeat the same action. The token limit catches runs that take fewer but heavier steps. When either is reached, the agent should stop in a defined way: return a partial result with an explanation, hand off to a person, or summarize progress and ask to continue. {% highlight %}Silent truncation of the plan is the worst outcome{% /highlight %}, because the user receives an answer that looks complete.
+
+### Shrink what repeats
+
+The cheapest tokens to save in a run are the ones that repeat every step. Send only the tool definitions the current step can use. Keep the system prompt short and stable. Replace large tool results with summaries once the model has acted on them. If your provider supports prompt caching for stable prefixes, check its current rules and pricing, because a stable prefix can change which parts of the budget are worth optimizing. The related article on [semantic caching for LLM applications](/blog/semantic-caching-llm-applications) covers caching strategies that avoid some calls entirely.
+
+{% editorial-panel eyebrow="Diagnostic shortcut" title="Read cost by position in the run." body="Plot tokens per call against the step number. A steady staircase means history is growing as designed. A sudden jump means one tool result or retrieval blew past its line. A flat line with many steps means a loop. The shape tells you which line to cap." tone="dark" /%}
+
+## Set the numbers: a procedure that uses evidence
+
+Budgets set by instinct tend to be either too generous to matter or too tight to survive. A short procedure based on traces avoids both.
+
+### A five-step calibration
+
+1. **Collect a sample.** Take a representative window of traffic for one request type, with per-line token counts and the outcome of each request.
+2. **Find the working range.** Compute the distribution of total input tokens and of output tokens. Look at the median, a high percentile and the maximum.
+3. **Relate size to quality.** If you have evaluation scores or user feedback, compare them across size buckets. You are looking for the point past which more tokens stop helping, or start hurting.
+4. **Set the ceiling near the knee.** Choose a ceiling that covers most of normal traffic and sits near the point of diminishing returns. Accept that the tail will be trimmed or escalated.
+5. **Replay before enforcing.** Run the new budget in shadow mode against recorded requests, count how many would be trimmed or rejected, and examine a sample of the trimmed ones before turning enforcement on.
+
+Step three is the one most teams skip, and it is where the budget earns its credibility. Without a link to quality, a cap is just a cost target, and the first quality complaint will remove it. The guide to [reducing LLM costs without hurting quality](/blog/reduce-llm-costs-without-hurting-quality) walks through how to evaluate a cost change safely.
+
+### Worked scenario with illustrative numbers
+
+The numbers below are made up to show the method; they are not benchmarks. Suppose a support assistant's input has a median of 4,200 tokens, a 95th percentile of 8,800 and a maximum of 21,000. Outputs have a median of 350 tokens and a 95th percentile of 900.
+
+| Observation | Weak interpretation | Better next move |
+| --- | --- | --- |
+| The maximum is 21,000 tokens | Set the cap at 21,000 to be safe | Inspect the longest runs; they are often loops or oversized tool results, not legitimate demand |
+| The 95th percentile is 8,800 | Cap at exactly 8,800 | Set the cap slightly above, such as 9,000, then check quality on trimmed requests |
+| Output median is 350 | Reserve 350 | Reserve near the 95th percentile plus margin, so long answers are not truncated |
+| Few requests are trimmed after replay | The budget is proven | Check whether the trimmed ones are the hard cases that matter most |
+
+The last row deserves emphasis. {% highlight %}Trimming affects the tail, and the tail often contains the complex requests users care about most.{% /highlight %} A budget that looks harmless on average can concentrate its damage on the hardest cases, so evaluate those specifically.
+
+## Observe: instrument the budget itself
+
+A budget produces its own data, and that data is what lets you improve it. Without it, you are tuning blind.
+
+### What to record on each model call
+
+| Field | Why it matters |
+| --- | --- |
+| Request type | Budgets are set per type, so every analysis groups by it |
+| Ceiling and reserve in force | Shows which budget version applied |
+| Tokens per line before and after trimming | Shows which line is responsible for size |
+| Verdict: fit, trimmed, rejected, routed | The primary health signal for the budget |
+| Provider-reported input and output tokens | Ground truth to calibrate your counter |
+| Finish reason | Detects answers cut off by the output limit |
+| Units removed | Lets you reproduce what the model saw |
+
+These fields are plain attributes on a span. They do not require a special system, and if you already send traces to Uncoil or another tracing backend, they sit next to the existing token counts. The article on [LLM observability metrics that matter](/blog/llm-observability-metrics-that-matter) helps decide which of these deserve a dashboard and which are only for drill-down.
+
+### Four signals worth alerting on
+
+1. **Trim rate per request type.** A rising share of trimmed requests means the target is drifting below real demand or a source is growing.
+2. **Reject and escalate rate.** Any sustained rise is user-visible and needs an owner.
+3. **Length-limited finish rate.** This is the direct measure of a reserve that is too small.
+4. **Estimate error.** The gap between your counter and the provider-reported number. If it widens after a model change, the tokenizer assumption is stale.
+
+### Review on a cadence
+
+Budgets should be reviewed when a prompt changes, when the model changes, when a new data source is added, and on a regular schedule such as monthly. The review is short: look at the four signals, look at a sample of trimmed requests, and decide to hold, raise or lower. Record the decision with the reasoning so the next reviewer does not have to rediscover it.
+
+## Failure modes and trade-offs
+
+Every budget has a price. Naming it keeps the decision honest.
+
+### What goes wrong
+
+- **Over-tight budgets degrade answers quietly.** The user never sees an error. They see a plausible answer that is missing context. Only evaluation and sampling reveal this.
+- **Over-loose budgets do nothing.** If the cap is above nearly every request, it is decoration. Check that it actually binds in the tail.
+- **Unstable prefixes defeat caching.** Reordering sections or injecting timestamps near the top of a prompt can change what is reusable. Check your provider's rules before shuffling the layout.
+- **Counting mismatch.** If the counter and the provider's tokenizer disagree, requests that look compliant are rejected or, worse, requests that look too large are needlessly trimmed.
+- **Summaries that drift.** Repeated summarization of summaries loses detail in ways that are hard to notice. Keep a bounded number of summarization layers and keep raw recent turns.
+- **Budget gaming.** Teams under pressure to cut cost may raise trim rates and call it success. Always pair a cost metric with a quality metric.
+
+### Security boundary
+
+Budgeting touches data, so it touches security. Trimming must never remove a safety instruction or a policy block; mark those lines as non-trimmable and test that they survive. A very long user message or retrieved document is also a vector for prompt injection, because large inputs make it easier to hide an instruction. A cap on untrusted content is a modest defense, not a sufficient one. The article on [prompt injection defense](/blog/prompt-injection-defense) explains why untrusted text needs separate handling no matter how small it is.
+
+Do not log full prompts into traces just to record what was trimmed. Record sizes, counts and identifiers, and store content only where your data handling policy allows it. A budget log that copies sensitive text into a wider-access system creates a new problem while solving an old one.
+
+![A decision flow: assemble the prompt, compare it to the ceiling, trim in order down to each floor, then either send, route, summarize or reject](/media/llm-token-budgeting-per-request-decision.svg)
+
+*The decision flow for one request. Every branch ends in a recorded verdict, and nothing is sent in a state the plan did not anticipate.*
+
+## Read the lower half: when the budget is the wrong tool
+
+A budget is not always the right answer to a cost problem. {% highlight %}If most requests are being trimmed, the budget is exposing a design problem, not solving it.{% /highlight %} Recognize these conditions.
+
+### Signals that the architecture needs to change
+
+- The floors of the required lines already consume most of the ceiling. The prompt is carrying too much fixed weight, such as a long system prompt or a large tool catalog.
+- The same large document is sent on every call. Consider retrieval of only the relevant part, caching a stable prefix, or restructuring the task.
+- Quality depends on whole documents. Trimming will harm the answer, so the right responses are routing to a larger window, splitting the task, or accepting the cost for that request type.
+- The agent frequently exhausts its per-run budget. The task may need a better plan, a different decomposition, or a human checkpoint.
+
+### When to prefer a different control
+
+For some features, a rate limit, a per-user quota or a model switch is a better primary control than a per-request cap. A per-request budget limits the size of each request; it does not limit how many requests a user makes. Use the cap for size, quotas for volume and attribution for accountability, and keep them separate so each can be tuned on its own evidence.
+
+{% editorial-panel eyebrow="Decision room" title="Ship the budget only when you can answer four questions." body="What is the ceiling and who chose it? Which line is trimmed first and why? What happens when nothing fits? Which trace field shows that the budget is working? If any answer is missing, run the budget in shadow mode and keep collecting evidence." tone="paper" /%}
+
+### A short rollout path
+
+Roll out in reversible stages. First, record per-line sizes and the verdict the budget would produce, without enforcing. Second, enforce only the output limit and the hard maximum, which are the lowest risk. Third, enable trimming for one request type, with an evaluation sample watching quality. Fourth, add the escalation path and the per-run limit for agents. Each stage can be turned off by configuration, and each produces data for the next. A budget that can be rolled back in minutes will be accepted by the teams that depend on the feature.
+
+## Checklist: your next move
+
+Use this as a release decision for a request type. If a box cannot be ticked, the budget is not ready to enforce.
+
+- [ ] The ceiling is the smaller of the window minus the reserve and the team cap, and the reserve comes from observed output lengths.
+- [ ] Every input line has a name, a target and a floor, and the floors sum to less than the ceiling.
+- [ ] The trim order is written down, trims whole units, and never touches instructions, safety rules or the user message.
+- [ ] An escalation path exists for the case where nothing fits, and its share is tracked.
+- [ ] An explicit output limit is set on every call, and length-limited finishes are alerted on.
+- [ ] Spans record per-line sizes, the verdict, provider-reported tokens and the finish reason.
+- [ ] Agents have both a step limit and a token limit per run, with a defined stop behavior.
+- [ ] The budget was replayed in shadow mode, and a sample of trimmed requests was inspected for quality.
+- [ ] The entry has an owner and a review trigger tied to prompt, model and data-source changes.
+
+The next move is small. Pick one request type with meaningful traffic, pull its token distribution from your traces, and write the four lines of the model for it: the reserve, the allocation, the trim order and the escalation. Run it in shadow mode for a week, read the trimmed samples, and only then turn enforcement on. That single request type will teach you more about your system than a global cap set by instinct.
+
+## Frequently asked questions
+
+{% faq-item question="Is a token budget the same as the model's context window?" answer="No. The context window is the maximum the model can accept, including the answer. A budget is your own smaller limit for a request type, set from evidence about what the task needs, cost and latency. Keep the budget below the window and subtract the output reserve before allocating input." /%}
+{% faq-item question="How do I choose the output token limit?" answer="Take the distribution of completion lengths for that request type from your traces and set the limit near a high percentile plus a small margin. If the finish reason shows answers hitting the limit, raise it for that type. Check whether your model counts internal reasoning tokens against the same limit." /%}
+{% faq-item question="What should be trimmed first when a prompt is too long?" answer="Trim the content least likely to change the answer: tool results the model has already used, then the lowest ranked retrieved passages, then the oldest history turns. Never trim system instructions, safety rules or the current user message. Write the order down and record every cut." /%}
+{% faq-item question="Should I reject over-budget requests or route them to a bigger model?" answer="It depends on the request type. Reject when the input is outside the intended scope, route when the task truly needs the context, and summarize or ask the user to narrow it when the input is compressible or sprawling. If you route, track the share of routed requests so the cap does not quietly become a suggestion." /%}
+{% faq-item question="How often should a token budget be reviewed?" answer="Review it whenever the prompt, the model or a data source changes, and on a regular schedule such as monthly. Look at trim rate, reject rate, length-limited finishes and counter error, inspect a sample of trimmed requests, then record whether you held, raised or lowered the cap." /%}
