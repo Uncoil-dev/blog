@@ -1,0 +1,334 @@
+---
+title: "AI Agent Rate Limit Handling: Retries That Do Not Make It Worse"
+slug: ai-agent-rate-limit-handling
+excerpt: Handle provider rate limits in AI agents with budgets, backoff, jitter, queues, and trace fields that show whether a retry helped or deepened the problem.
+publishedAt: 2026-11-20T09:00:00.000Z
+author: Uncoil Team
+draft: true
+categories:
+  - operations
+tags:
+  - rate limits
+  - retries
+  - reliability
+  - AI agents
+relatedPosts:
+  - ai-agent-reliability-failures-retries-guardrails
+  - ai-agent-cost-attribution
+  - ai-agent-slos-error-budgets
+heroImage:
+  src: /media/ai-agent-rate-limit-handling-hero.svg
+  alt: Illustration of request tokens queuing at a metered gate while a retry loop feeds more tokens back into the queue
+seo:
+  metaTitle: "AI Agent Rate Limit Handling: Backoff, Budgets, and Traces"
+  metaDescription: Design AI agent rate limit handling with retry budgets, jittered backoff, queues, and trace fields that show whether retries helped.
+---
+
+An agent that hits a provider rate limit rarely fails once. It fails, retries, fails again, and meanwhile every other run in the same process is doing the same thing. The retry loop that was meant to absorb a brief spike becomes the thing that keeps the limit saturated. This guide is for engineers who own an agent that calls a model provider, a search API, or any metered tool, and who need rate limit responses to end in a bounded, observable outcome instead of a pile of duplicated work.
+
+{% trace-scenario title="Is this retry safe to send?" prompt="A run's third model call returns HTTP 429 after two earlier calls in the same run already succeeded. Forty other runs are in flight against the same provider key. What should happen before the retry is sent?" outcome="Check the retry budget for the whole key, not just this run, wait for the longer of the server hint and the computed backoff with jitter, and record the attempt on the trace. A retry that ignores shared load can turn one limited run into forty." /%}
+
+## At a glance
+
+![Decision map showing a 429 response flowing through classify, budget, wait, retry or fail, with a trace record at each stage](/media/ai-agent-rate-limit-handling-orientation.svg)
+
+The reader is an engineer who already has an agent in production, or close to it. The job is to decide what the agent does when a dependency says "slow down". The outcome is a policy with four properties: it classifies the response, spends a budget instead of retrying forever, waits in a way that does not synchronize with other callers, and leaves enough evidence on the trace to judge afterward whether the retry was worth it.
+
+The article boundary is deliberately narrow. It covers client-side behavior when a rate limit or overload response arrives. It does not cover negotiating higher quotas with a provider, choosing between providers on price, or hard cost caps, which {% highlight %}belong to cost control rather than rate limit handling{% /highlight %}. Where those topics touch, the text says so and moves on.
+
+### The operating model: classify, budget, wait, decide, record
+
+Every rate limit decision in this guide follows the same five steps. The names are ours, not an industry standard, and the order matters.
+
+| Step | Question | Evidence it uses |
+| --- | --- | --- |
+| Classify | Is this error worth retrying at all? | Status code, error body, provider hint |
+| Budget | Can the whole system afford another attempt? | Shared retry tokens, in-flight count |
+| Wait | How long until the retry is polite? | Server hint, computed backoff, jitter |
+| Decide | Retry, switch model, queue, or fail? | Remaining run deadline, fallback options |
+| Record | What will the next reader of the trace need? | Attempt number, wait time, outcome |
+
+Most incidents involving rate limits come from skipping a step. Teams that never classify retry errors that will never succeed. Teams that never budget get retry storms. Teams that never record cannot tell a healthy spike from a slow degradation.
+
+## Understand what a rate limit actually tells you
+
+A rate limit response is information about the provider's view of your traffic, not a random failure. Treating it like a network blip discards that information.
+
+### Limits are usually several limits
+
+Provider limits commonly apply to more than one quantity at once: requests per minute, tokens per minute, and sometimes concurrent requests or tokens per day. Exact quantities, names, and windows differ by provider and plan, and they change, so check the current documentation of the provider you use rather than relying on this article for numbers. The practical consequence is stable across providers: a single agent run can be fine on request count and still exceed a token limit because one prompt carried a large context.
+
+That distinction changes the right response. If you are over a requests-per-minute limit, spreading calls over time helps. If you are over a tokens-per-minute limit because of a few very large prompts, spreading helps less than shrinking the prompts or routing the large ones to a different path.
+
+### The response carries hints, but not always
+
+Many providers return a status code of 429 and may include headers that say how long to wait or how much quota remains. Header names and semantics are provider specific, and some responses carry nothing useful. A robust client reads a wait hint when one is present, parses it defensively, and falls back to its own backoff when it is absent or malformed. It should never trust a hint blindly either: a hint of several hours inside an interactive agent run is a signal to fail fast and say so, not to sleep.
+
+### Rate limits are not the only transient error
+
+A 429 is one member of a family. Overload responses, gateway errors, and timeouts look similar from the outside and are often retried by the same code. They differ in what retrying means. A rate limit says "you in particular are too fast". An overload says "everyone is too much for us right now". A timeout says nothing about whose fault it is, and the request may have succeeded on the server. Keeping those classes separate in your logic and on your traces is what makes later analysis possible.
+
+## Classify before you retry
+
+Classification is the cheapest step and the one most often skipped. The aim is to separate errors where waiting can help from errors where it cannot.
+
+### A working classification table
+
+| Signal | Class | Retry? | Reason |
+| --- | --- | --- | --- |
+| HTTP 429 with a wait hint | Rate limited | Yes, after the hint | Server told you when capacity returns |
+| HTTP 429 without a hint | Rate limited | Yes, with backoff | Window will reset, length unknown |
+| HTTP 5xx or overload message | Provider overloaded | Yes, with backoff and a lower cap | Retrying adds load to a stressed service |
+| Timeout | Unknown outcome | Only if the call is safe to repeat | The first attempt may have completed |
+| HTTP 400 or 422 | Invalid request | No | The same request fails again |
+| HTTP 401 or 403 | Authorization | No | Waiting does not grant access |
+| Quota exhausted for a billing period | Hard limit | No | Backoff cannot create quota |
+
+The last row is the one that surprises teams. Some providers use the same status code for a short-window rate limit and for exhausted account quota or credit. A client that retries every 429 will spin on the second kind for as long as its attempts allow. Where the error body distinguishes them, branch on that distinction. Where it does not, keep the attempt cap low so the cost of guessing wrong is bounded.
+
+### What the Uncoil SDK does today
+
+The Uncoil TypeScript SDK exposes an orchestration helper whose retry policy names which error classes are retryable. In the current source the recognized values include `timeout`, `5xx`, `429`, `rate_limit`, and `overloaded`. A `429` entry matches an HTTP status of 429 or error text mentioning a rate limit or too many requests, `rate_limit` matches 429 or text mentioning a rate limit or throttling, and `overloaded` matches text mentioning overload, capacity, or busy. An abort caused by the latency budget is never treated as retryable.
+
+Between attempts the helper waits `backoffMs` multiplied by `backoffMultiplier` raised to the attempt number minus one. Two limitations are worth knowing before you rely on it. The delay is deterministic, so it has no jitter, and the helper does not read a provider's wait hint. Both matter for the reasons described below. If you need jitter or hint-aware waits today, apply them inside your own `call` function or in a wrapper before the request reaches the helper. The SDK is built but not yet published to a package registry at the time of writing, so treat the following code as illustrative of the policy shape.
+
+```ts
+// Illustrative: policy shape taken from the current Uncoil TypeScript SDK source.
+// Check the SDK for the exact, current option names before using.
+const policy = {
+  enforcementMode: "enforce",
+  fallbackChain: ["secondary-model"],
+  retryPolicy: {
+    maxAttempts: 3,        // retries after the first attempt
+    backoffMs: 500,        // base delay before the first retry
+    backoffMultiplier: 2,  // 500ms, then 1000ms, then 2000ms
+    retryableErrors: ["429", "overloaded", "timeout"],
+  },
+  latencyBudgetMs: 30000,  // aborts are never retried
+};
+```
+
+## Spend a retry budget, not unlimited retries
+
+The most important idea in this article is that {% highlight %}retries are a resource with a cost{% /highlight %}, and the cost is paid by everyone sharing the dependency.
+
+### Why per-run limits are not enough
+
+A per-run cap of three attempts sounds conservative. With forty concurrent runs against one provider key, a limit event can produce up to a hundred and twenty extra requests within seconds, all aimed at a service that has just asked for fewer. If each of those fails and the next layer up also retries, the multiplication continues. {% highlight %}Retry layers compound{% /highlight %}: an agent framework that retries three times around an SDK that retries three times around an HTTP client that retries three times produces up to twenty-seven attempts for one logical call. Inventory every layer that can retry before choosing numbers for any of them.
+
+{% editorial-panel eyebrow="Operating principle" title="Retry once at the layer that knows the most." body="Choose one layer to own retries for each dependency, usually the one closest to the provider call that can see status codes and hints. Disable or cap retries in every other layer so a single failure cannot be multiplied by nesting." tone="yellow" /%}
+
+### A shared token budget
+
+A retry budget limits retries as a fraction of normal traffic across the whole process or key. A simple form works like a token bucket. Every successful call adds a small amount to the bucket, up to a ceiling. Every retry removes one token. When the bucket is empty, a failed call does not retry and the failure is surfaced. Under normal load the bucket is full and retries are available. During a sustained limit event, successes stop arriving, the bucket drains, and retries stop on their own without anyone toggling a switch.
+
+The ratio is a design choice. A common approach is to allow retries only up to a modest fraction of recent successful traffic, such as one retry for every ten successes. Treat that figure as a starting point to tune against your own traces rather than a recommendation with evidence behind it for your workload.
+
+```ts
+// Illustrative retry budget. Not a published Uncoil API.
+export class RetryBudget {
+  private tokens: number;
+  constructor(
+    private readonly max: number,
+    private readonly earnPerSuccess: number,
+  ) {
+    this.tokens = max;
+  }
+
+  recordSuccess(): void {
+    this.tokens = Math.min(this.max, this.tokens + this.earnPerSuccess);
+  }
+
+  tryAcquire(): boolean {
+    if (this.tokens < 1) return false;
+    this.tokens -= 1;
+    return true;
+  }
+}
+
+// One budget per provider key, shared by every run in the process.
+const modelBudget = new RetryBudget(50, 0.1);
+```
+
+Three details make this usable. Scope one budget to each dependency key, so a limited search API does not block model retries. Share it across runs in the process, and across processes if your deployment is large enough that process-local counts mislead you. And have the failure that results from an empty budget carry a distinct error type, so dashboards separate "gave up because the budget was empty" from "gave up after the attempt cap".
+
+> **Decision rule:** If the retry budget is empty, fail the call with a typed error immediately. Do not sleep and try anyway. A budget that can be overridden by waiting longer is just a delay.
+
+## Wait politely: backoff, hints, and jitter
+
+Once a retry is allowed, the remaining question is when to send it.
+
+### Exponential backoff and why it is not enough
+
+Exponential backoff increases the delay after each failed attempt, so a persistent problem receives progressively less pressure. It solves the problem of one caller hammering a service. It does not solve synchronized callers. If forty runs all failed at the same instant, they all wait the same 500 milliseconds and all retry at the same instant, then all wait 1000 milliseconds and retry together again. The load arrives in waves with the same shape as the original spike.
+
+### Add jitter
+
+Jitter randomizes each delay so callers disperse. Two common forms are full jitter, where the delay is a random value between zero and the computed backoff, and equal jitter, where half the backoff is fixed and half is random. Full jitter spreads load most evenly but can produce very short waits. Equal jitter keeps a floor. {% highlight %}Either is much better than none{% /highlight %}, and the choice matters less than having one.
+
+```ts
+// Illustrative: full jitter with a ceiling, honoring a server hint when present.
+export function nextDelayMs(
+  attempt: number,          // 1 for the first retry
+  baseMs: number,
+  capMs: number,
+  serverHintMs?: number,
+  random: () => number = Math.random,
+): number {
+  const ceiling = Math.min(capMs, baseMs * 2 ** (attempt - 1));
+  const jittered = Math.floor(random() * ceiling);
+  const hint = Number.isFinite(serverHintMs) && serverHintMs! > 0 ? serverHintMs! : 0;
+  return Math.max(jittered, hint);
+}
+```
+
+The function takes the larger of the jittered delay and the server hint, because waiting less than the hint predictably produces another limit response. It accepts the random source as a parameter so a test can pass a fixed value and assert exact output, which is how you keep timing logic testable.
+
+### A worked comparison
+
+Consider forty runs that all receive a 429 at the same moment, with a base delay of 500 milliseconds and no server hint.
+
+| Policy | First retry arrives | Shape of the load |
+| --- | --- | --- |
+| Fixed delay | All forty at 500 ms | One spike of forty, same as the original |
+| Exponential, no jitter | All forty at 500 ms, then all at 1000 ms | Repeating spikes, each as tall as the first |
+| Exponential with full jitter | Spread across 0 to 500 ms | Roughly even trickle, shrinking each round |
+| Jitter plus empty budget | Only budgeted retries sent | Bounded extra load, rest fail fast |
+
+The numbers in the second column follow from the formulas, not from a measurement. Real behavior depends on how the provider windows and queues requests, so confirm with your own traces before treating the shape as a prediction.
+
+### Respect the run deadline
+
+A wait is time the user is also waiting. Before sleeping, compare the delay with the time left in the run. If the delay plus an expected call duration exceeds what remains, retrying cannot succeed in time. Take the alternative path now, whether that is a fallback model, a queue, or a clear failure.
+
+> **Operating note:** A retry that will finish after the deadline is a failure with extra cost. Check remaining time before every wait, not after.
+
+## Choose where the waiting happens
+
+Backoff inside a request handler holds a connection, a worker, and a user. For short agent runs that is acceptable. For longer ones, the better question is whether this work should be waiting in-process at all.
+
+### Three places to wait
+
+| Placement | Good for | Cost |
+| --- | --- | --- |
+| In-process sleep and retry | Interactive runs, short delays | Holds resources, lost on restart |
+| Client-side queue with concurrency cap | Bursty traffic to one key | Added complexity, latency under load |
+| Durable job queue with scheduled retry | Background and batch agents | Needs idempotent steps and state |
+
+{% highlight %}A concurrency cap is often more effective than any retry tuning{% /highlight %}, because it prevents the limit event rather than responding to it. Cap in-flight calls per dependency to a number the provider tolerates, queue the rest, and the number of 429 responses drops. This does not replace retries, since limits can still be hit, but it moves the system away from the edge.
+
+### Prioritize inside the queue
+
+When capacity is scarce, not every run is equal. A user waiting on a response should usually go ahead of a nightly batch. Give the queue at least two classes, interactive and background, and let background work yield when the limit response rate rises. Priority is a policy decision that someone owns, so write down which workflows are in which class, rather than leaving it to arrival order.
+
+## Make retries safe to repeat
+
+A retry is a second execution. Whether that is harmless depends on what the first one did.
+
+### Idempotency in agent steps
+
+A model call is generally safe to repeat in the sense that repeating it does not change external state, though it does cost tokens again. A tool call that sends an email, creates a ticket, or writes a record is not. If a timeout occurs after a tool call was sent, the call may have happened. Retrying blindly can duplicate the effect.
+
+For tools with side effects, use an idempotency key where the receiving system supports one: a stable identifier derived from the run and step, sent with each attempt, so the service can recognize a repeat. Where the system does not support keys, check state before retrying, or do not retry that step automatically and escalate instead.
+
+> **Security note:** Never retry a side-effecting tool call after an ambiguous failure without an idempotency key or a state check. For actions involving payments, deletion, or access changes, route ambiguity to a human instead of repeating.
+
+### Partial progress and replay cost
+
+An agent run is a sequence of calls. If the fifth call is limited, should the run restart from the beginning or continue from the fifth? Restarting repeats the cost of four successful calls and may hit the limit again sooner, since you are sending more requests per run. Resuming requires that intermediate state be preserved. For anything longer than a few calls, retry the single failed call, not the whole run, and keep the earlier results in the run's state.
+
+## Fall back without hiding the problem
+
+A fallback model or provider can keep a run alive when the primary is limited. It also changes behavior, so it needs rules.
+
+### Rules for fallbacks
+
+- Fallbacks should be explicit in configuration, ordered, and known to the people who own quality.
+- A fallback model may produce different output, so evaluate it before enabling it for a task where output quality matters.
+- Fallbacks carry their own limits. Falling back during a broad outage can move the whole load onto a second service that was sized for a fraction of it.
+- Record that a fallback was used. A run that succeeded on a fallback is not the same outcome as one that succeeded on the primary, and aggregates that merge them hide a quality change.
+
+The SDK helper described earlier treats a fallback as a single attempt rather than applying the full retry policy to it. That choice limits amplification but also means a limited fallback fails the run quickly, which is usually what you want.
+
+### When degradation beats waiting
+
+Sometimes the right response is a smaller answer. Skipping an optional enrichment step, using a cached result, or returning a partial result with a clear note can serve the user better than a ninety-second wait. Decide per workflow which steps are essential and which can be shed, and encode it ahead of time. A decision made during an incident tends to be a worse decision.
+
+## Record every attempt on the trace
+
+Without evidence, retry behavior is opinion. With the right fields, you can answer whether retries helped.
+
+### Fields worth capturing
+
+The Uncoil span model already includes a `retryCount`, an `errorType`, and an `errorMessage`, and the orchestration helper records per-attempt metadata such as whether the error was judged retryable and whether a retry would follow. Beyond those, the following additions make rate limit analysis practical. Name them according to your own schema, and see the guide to [the AI agent trace schema](/blog/ai-agent-trace-schema) for how fields fit together.
+
+| Field | Why it matters | Question it answers |
+| --- | --- | --- |
+| Attempt number | Separates first tries from retries | How often does the first attempt succeed? |
+| Error class | Distinguishes rate limit, overload, timeout | Which kind of failure dominates? |
+| Wait applied | Records the delay actually slept | Did we honor hints and jitter? |
+| Hint received | Stores the provider's suggestion if any | Are we waiting less than we were told? |
+| Budget state | Remaining tokens at decision time | Did the budget block a retry? |
+| Outcome | Success, exhausted, budget empty, deadline | Did the retry help? |
+| Fallback used | Which model finally answered | Did quality or cost change? |
+
+Keep these fields free of secrets. The authorization header and the request body do not belong in retry metadata, and error messages from providers can echo parts of a request, so redact before storing.
+
+### Metrics to derive
+
+Three numbers cover most reviews. The first-attempt success rate tells you how often you are near the limit. The retry success rate, meaning the share of retried calls that eventually succeed, tells you whether retrying is productive. The retry amplification, meaning total attempts divided by logical calls, tells you how much extra load you are sending. If amplification is rising while retry success is falling, retries are adding load without returning value. That pattern is {% highlight %}the signature of a retry storm{% /highlight %}, and it is the signal to cut attempts rather than raise them.
+
+{% editorial-panel eyebrow="Diagnostic shortcut" title="Read amplification before reading errors." body="A rising error count tells you something is wrong. A rising ratio of attempts to logical calls tells you your own reaction is making it worse. Check the ratio first, then decide whether to cut retries or add capacity." tone="dark" /%}
+
+## Read the lower half visually
+
+![Timeline comparing synchronized retries with jittered retries and a budgeted cutoff across three rounds](/media/ai-agent-rate-limit-handling-jitter.svg)
+
+The diagram contrasts three behaviors under the same initial spike. Without jitter, each round is a wall of identical height. With jitter, the same retries disperse and each round is smaller. With a budget, the later rounds are cut off and the failures are reported instead of repeated. Applying all three together is what turns a spike into a bounded event.
+
+### Reading a real incident
+
+Imagine the following sequence in a trace review, described here as a hypothetical rather than a measured case. A deploy increases the average prompt size. Token usage per minute approaches the provider's limit. Occasional 429 responses begin. The retry policy has no jitter and a high attempt cap. Retried requests carry the same large prompts, so they consume the same tokens again. Within minutes, {% highlight %}the share of runs that fail rises{% /highlight %}, and total token spend rises too, because failed attempts are billed or counted against the limit depending on the provider.
+
+The first useful question is not "why are we getting 429s" but "{% highlight %}attempts per logical call{% /highlight %}". If it has risen from near one to well above, the retry layer is part of the cause. The second question is "what changed", and the deploy comes up. The fix has two parts: shrink the prompts, and cap and jitter the retries so the next limit event does not repeat this shape. Our guide to [attributing agent cost](/blog/ai-agent-cost-attribution) covers how to tie the extra spend to the release that caused it.
+
+### What changes the recommendation
+
+This approach assumes a shared provider limit and a latency-sensitive caller. If you control the limit, for example by self-hosting a model, the right response may be to scale capacity instead. If traffic is entirely batch and deadline-free, long durable retries are fine and an in-process sleep is the wrong tool. If the provider's error responses are unreliable at distinguishing hard quota from rate limit, keep attempts low and alert on repeated 429s from the same key so a human can look.
+
+## Decide what ships
+
+{% editorial-panel eyebrow="Decision room" title="Ship the bounded version first." body="A classifier, a per-key retry budget, jittered waits, and trace fields cover most of the value. Queues, priorities, and fallbacks can follow once the traces show where they would pay off." tone="paper" /%}
+
+Retries belong inside your reliability goals, not outside them. A target for the share of runs that succeed within a latency threshold, as covered in our guide to [SLOs and error budgets for agents](/blog/ai-agent-slos-error-budgets), gives you a principled way to decide how much retry effort a workflow deserves. A workflow with a loose target can fail fast. A workflow with a strict target justifies queues and fallbacks. For the broader picture of how retries sit beside guardrails and failure handling, the article on [reliability, retries, and guardrails](/blog/ai-agent-reliability-failures-retries-guardrails) frames the surrounding decisions.
+
+### A staged rollout
+
+1. Add trace fields first, with no behavior change, and observe attempt counts for a week or a representative period.
+2. Add classification, so non-retryable errors stop retrying.
+3. Add the shared budget in observe mode, logging when it would have blocked a retry.
+4. Enable the budget and jitter for one low-risk workflow, and compare amplification and retry success.
+5. Extend to other workflows, adding queues and priorities where traces show contention.
+
+{% highlight %}Each step is reversible and measurable.{% /highlight %} If a step makes outcomes worse, the previous trace data tells you which one.
+
+## Leave with a checklist for the next move
+
+- [ ] Every retry layer in the stack is inventoried, and exactly one owns retries per dependency.
+- [ ] Errors are classified, and hard quota, invalid request, and authorization failures never retry.
+- [ ] A retry budget is shared across runs for each dependency key, and an empty budget fails fast with a typed error.
+- [ ] Waits use jitter and honor a server hint when one is present and sensible.
+- [ ] The remaining run deadline is checked before every wait.
+- [ ] Side-effecting tool calls use idempotency keys or a state check before any retry.
+- [ ] Traces record attempt number, error class, wait applied, hint, budget state, outcome, and fallback used, with secrets redacted.
+- [ ] First-attempt success, retry success, and amplification are reviewed on a schedule, and a rising amplification with falling retry success triggers a cut in attempts.
+
+Start with the smallest change that produces evidence: add the attempt and outcome fields to your existing spans, and look at one day of amplification. That number will tell you whether your next change should be a budget, a jitter fix, or a conversation with the provider.
+
+## Frequently asked questions
+
+{% faq-item question="Should I retry every 429 response?" answer="No. Retry rate limit responses that signal a window reset, and stop on responses that indicate exhausted quota or billing limits, since waiting cannot create quota. Where the error body does not distinguish them, keep the attempt cap low so a wrong guess is cheap, and alert on repeated 429s from one key." /%}
+{% faq-item question="Is exponential backoff alone enough?" answer="Not when many callers fail together. Without jitter they wait the same time and retry together, recreating the spike in waves. Add jitter, cap the maximum delay, and use a shared retry budget so total retry load stays bounded regardless of how many runs are in flight." /%}
+{% faq-item question="How many retry attempts should an agent make?" answer="There is no universal number. Start low, often two or three attempts per call, and tune against traces using retry success rate and amplification. If later attempts rarely succeed, lower the cap. The right number also depends on how much of the run deadline a wait would consume." /%}
+{% faq-item question="Should a rate limit trigger a fallback model?" answer="Sometimes. A fallback keeps runs alive but may change output quality and can move load onto a second service that was not sized for it. Enable it per workflow after evaluating quality, apply a single attempt on the fallback, and always record which model answered." /%}
+{% faq-item question="How do I know whether retries are helping?" answer="Compare first-attempt success, retry success, and amplification, which is total attempts divided by logical calls. If amplification rises while retry success falls, retries are adding load without returning value, and the correct response is to cut attempts, add jitter, or enforce a budget." /%}
