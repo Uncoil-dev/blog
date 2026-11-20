@@ -1,0 +1,377 @@
+---
+title: "AI Agent Tool Timeouts and Retries: Budgets That Fail Safely"
+slug: ai-agent-tool-timeouts-and-retries
+excerpt: How to set timeouts, retry limits, and backoff for agent tool calls so slow dependencies stay recoverable, side effects stay single, and traces show exactly what happened.
+publishedAt: 2026-11-20T12:00:00.000Z
+author: Uncoil Team
+draft: true
+categories:
+  - engineering
+tags:
+  - reliability
+  - tool calls
+  - AI agents
+relatedPosts:
+  - ai-agent-reliability-failures-retries-guardrails
+  - ai-agent-failure-modes
+  - ai-agent-trace-schema
+heroImage:
+  src: /media/ai-agent-tool-timeouts-and-retries-hero.svg
+  alt: A timeline showing three tool-call attempts with growing backoff gaps inside one shared step deadline, the last attempt clipped to the time remaining
+  card: /media/ai-agent-tool-timeouts-and-retries-hero.svg
+  hero: /media/ai-agent-tool-timeouts-and-retries-hero.svg
+  og: /media/ai-agent-tool-timeouts-and-retries-hero.svg
+seo:
+  metaTitle: "AI Agent Tool Timeouts and Retries: Budgets That Fail Safely"
+  metaDescription: Set timeouts, retry limits, backoff, and idempotency rules for AI agent tool calls, and trace every attempt so failures stay diagnosable.
+---
+
+{% trace-scenario title="The tool call that hangs" prompt="Your agent calls a search tool that normally answers in one second. Today it has been silent for forty seconds, the user is still waiting, and the model has already decided its next step depends on the answer. Do you wait longer, retry immediately, retry with a delay, or give up and tell the user?" outcome="The right move depends on four facts you should decide before the incident: how long the user will actually wait, whether repeating the call can cause a second side effect, how much of the run's time budget is left, and whether the dependency is failing for everyone. This article turns those four facts into a timeout and retry policy you can write down, test, and read back from a trace." /%}
+
+## At a glance
+
+![Four nested limits, from the user request down to a single attempt, each smaller than the one around it](/media/ai-agent-tool-timeouts-and-retries-budget.svg)
+
+This guide is for engineers who own an agent that calls tools: search, databases, internal APIs, payment or ticketing systems. Your job is to make slow and failing tools predictable. The outcome is a policy with {% highlight %}a bounded time budget, a bounded attempt count, and a stated rule for which calls may be repeated{% /highlight %}. The boundary is deliberate. We cover the tool-call layer. Model-call fallbacks, prompt repair, and evaluation design are separate problems, covered in the broader piece on [bounded retries, failure states, and guardrails](/blog/ai-agent-reliability-failures-retries-guardrails).
+
+### The operating model: budget, classify, repeat, record
+
+Every decision in this article hangs off four verbs.
+
+1. **Budget.** Give each attempt, each step, and the whole run a deadline, and make inner deadlines smaller than outer ones.
+2. **Classify.** When a call fails, decide whether the failure is transient, permanent, or ambiguous.
+3. **Repeat.** Retry only when the failure is transient, the operation is safe to repeat, and budget remains.
+4. **Record.** Emit one span per attempt with enough fields that a reader can reconstruct the decision afterward.
+
+| Stage | Evidence you need | Decision it drives |
+| --- | --- | --- |
+| Budget | Observed latency percentiles per tool, the user-facing time limit | Attempt timeout, step deadline, run budget |
+| Classify | Error type, status code, whether bytes were sent | Retry, fail fast, or ask |
+| Repeat | Idempotency of the operation, remaining budget, dependency health | Attempt count and delay |
+| Record | Attempt number, elapsed time, final outcome | Whether the policy is working |
+
+What this model does not solve: it does not make a wrong tool choice right, and it does not recover from a model that misreads a good result. It makes the tool boundary honest.
+
+## Why agents need different timeout rules than services
+
+A conventional service call has one caller waiting and one code path. An agent loop adds a decision-maker in the middle. The model reads each tool result, decides what to do, and often calls another tool. That changes three things.
+
+First, latency compounds. A run with six sequential tool calls and a model call between each one turns a modest per-call delay into a long wait. A tool that is "only" two seconds slower than usual adds that cost at every step that uses it.
+
+Second, a timeout is information the model will interpret. If a tool returns nothing after a deadline, the model may read the silence as "no results" and proceed with a confident but wrong answer. A timeout must therefore reach the model as an explicit, typed failure rather than an empty value.
+
+Third, retries can be issued by more than one layer. Your HTTP client may retry, your tool wrapper may retry, and the model itself may decide to call the tool again after a failure. Three layers each retrying three times is not three attempts. {% highlight %}It is twenty-seven.{% /highlight %}
+
+### Separate the layers that retry
+
+Decide which single layer owns retries for each tool and switch the others off. The usual choice is the tool wrapper, because it knows the operation's semantics. Turn off automatic retries in the HTTP client for that tool, and tell the model in the tool's error text that the wrapper has already retried, so it should not simply call again.
+
+> **Field note:** When a trace shows the same tool called many times in one second, count the layers before blaming the model. Multiplied retries from stacked clients are far more common than a model looping on purpose.
+
+## Phase one: choose timeouts from measured latency
+
+Timeouts guessed from intuition tend to be either so long that the user leaves or so short that healthy calls fail. Derive them from data.
+
+### Pick a per-attempt timeout from a high percentile
+
+Take the latency distribution for the tool over a representative week. Set the per-attempt timeout a little above the latency you consider normal tail behavior, then check how many healthy calls it would have cut. If a timeout would have cancelled a noticeable share of calls that eventually succeeded, it is too tight. If waiting for it costs more than the user will tolerate, the tool needs a different design, not a longer timeout.
+
+A useful starting rule, which you should replace with your own measurements, is to set the attempt timeout near two to three times the tool's typical high-percentile latency, then cap it by the share of the step deadline you are willing to spend on one try.
+
+### Use more than one timeout per call
+
+A single number hides where time went. Distinguish at least these:
+
+- **Connect timeout.** How long to wait for a connection. Failures here are almost always safe to retry because no request was processed.
+- **First-byte timeout.** How long to wait for any response. A failure here is ambiguous: the server may or may not have acted.
+- **Total timeout.** The hard ceiling for the whole attempt, including streaming a large body.
+
+The ambiguity of the middle case is the heart of the problem, and the next section deals with it directly.
+
+### Put a deadline on the step, not only the attempt
+
+Attempt timeouts bound one try. A step deadline bounds all tries plus the delays between them. Without it, three attempts of ten seconds with backoff can quietly consume far more than the thirty seconds you intended to spend. Compute the remaining time before each attempt and give that attempt the smaller of its own timeout and what remains.
+
+{% editorial-panel eyebrow="Operating principle" title="Inner limits must be smaller than outer limits." body="If the run budget fires before the step deadline, no retry ever gets to run and the failure looks like a mystery. Write the four limits down in one place and check them in a test." tone="yellow" /%}
+
+## Phase two: classify the failure before you retry
+
+Retrying is only useful when {% highlight %}the next attempt has a reasonable chance of a different result{% /highlight %}. Classification decides that.
+
+### Three classes of failure
+
+| Observation | Class | Usual action |
+| --- | --- | --- |
+| Connection refused, DNS failure, connect timeout | Transient, request never processed | Retry with backoff |
+| HTTP 429 or 503 with a retry hint | Transient, server asked you to wait | Retry after the hinted delay |
+| HTTP 400, 401, 403, 404, validation error | Permanent | Do not retry; surface to the model or user |
+| First-byte timeout, connection reset after send | Ambiguous, side effect may have happened | Retry only if the operation is idempotent |
+| HTTP 500 with no detail | Ambiguous | Limited retry for reads; check state first for writes |
+
+The rule that saves the most pain is to treat a permanent failure as permanent. Retrying a 403 three times does not make the caller authorized; it only delays the honest error and adds noise to the trace. Authentication and permission failures also deserve special care for security reasons, discussed later.
+
+### Give the model a typed failure, not silence
+
+When the wrapper gives up, return a structured result the model can reason about. Include the failure class, whether retries were already attempted, and what the model may reasonably do next. A message such as "tool timed out after 3 attempts; the operation was not confirmed; do not repeat it, ask the user whether to continue" produces a far better next step than an empty string.
+
+The failure categories also line up with the broader catalogue in [AI agent failure modes](/blog/ai-agent-failure-modes), where tool errors, silent empty results, and runaway loops are treated as distinct patterns with distinct controls.
+
+## Phase three: decide what is safe to repeat
+
+The most expensive mistake in this whole topic is repeating a side effect. A timeout does not tell you the request failed. {% highlight %}It tells you that you stopped waiting.{% /highlight %}
+
+### Reads are cheap, writes are not
+
+Repeating a read costs latency and load. Repeating a write can send a second email, create a second ticket, or move money twice. Group your tools by consequence and set the retry policy per group.
+
+| Tool group | Example | Retry stance |
+| --- | --- | --- |
+| Pure read | Search, lookup, fetch a record | Retry freely within budget |
+| Idempotent write | Set a field to a value, upsert by key | Retry; the second call has the same effect |
+| Keyed write | Create with a client-supplied idempotency key | Retry with the same key |
+| Non-idempotent write | Send message, charge, delete | Do not auto-retry; verify state or ask |
+
+### Use idempotency keys for writes you must retry
+
+If the downstream API supports an idempotency key, generate the key once per logical operation, not once per attempt, and send the same key on every retry. The server can then return the original result instead of acting twice. If the API has no such support, you can often build the check yourself: before retrying a create, look up whether the thing already exists.
+
+> **Decision rule:** If a write is not idempotent and you cannot verify its state, a timeout is a handoff, not a retry. Return the ambiguity to a person or a verification step.
+
+Operations that touch money, accounts, permissions, or deletion deserve the strictest version of this rule. Do not let a generic retry wrapper cover them by default. Keep them out of automatic retry unless a reviewer has explicitly approved the specific tool.
+
+### Keep the model from re-issuing the call itself
+
+Even when the wrapper refuses to repeat a write, the model can call the tool again on its own after a failure message. Two controls help. Phrase the failure text so it states that the operation may have partially succeeded. And add a per-run counter for non-idempotent tools so that a second call to the same one within a run requires confirmation. Neither control relies on the model behaving; the counter is enforced in code.
+
+## Phase four: write the retry loop
+
+Policy becomes real in code. The sketch below is illustrative: adapt the names to your tool wrapper, and test it against your own failure cases before relying on it. It shows the four ideas together: a shared deadline, classification, jittered exponential backoff, and one span per attempt.
+
+```ts
+// Illustrative sketch. Adapt names and error classes to your own tool layer.
+type Failure = "transient" | "permanent" | "ambiguous";
+
+interface Policy {
+  attemptTimeoutMs: number;
+  maxAttempts: number;      // total tries, including the first
+  baseDelayMs: number;
+  maxDelayMs: number;
+  idempotent: boolean;      // may an ambiguous failure be repeated?
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function backoff(attempt: number, p: Policy): number {
+  const cap = Math.min(p.maxDelayMs, p.baseDelayMs * 2 ** (attempt - 1));
+  return Math.random() * cap; // full jitter: spreads synchronized clients apart
+}
+
+export async function callTool<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  classify: (error: unknown) => Failure,
+  policy: Policy,
+  deadlineAt: number,       // absolute epoch ms shared by every attempt
+): Promise<{ ok: true; value: T; attempts: number } | { ok: false; reason: string; attempts: number }> {
+  for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) return { ok: false, reason: "deadline_exhausted", attempts: attempt - 1 };
+
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.min(policy.attemptTimeoutMs, remaining), // inner never exceeds outer
+    );
+
+    try {
+      const value = await run(controller.signal);
+      return { ok: true, value, attempts: attempt };
+    } catch (error) {
+      const kind = classify(error);
+      const repeatable = kind === "transient" || (kind === "ambiguous" && policy.idempotent);
+      if (!repeatable || attempt === policy.maxAttempts) {
+        return { ok: false, reason: kind, attempts: attempt };
+      }
+      const delay = backoff(attempt, policy);
+      if (Date.now() + delay >= deadlineAt) {
+        return { ok: false, reason: "deadline_exhausted", attempts: attempt };
+      }
+      await sleep(delay);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return { ok: false, reason: "exhausted", attempts: policy.maxAttempts };
+}
+```
+
+Read it as a set of questions asked in order on every failure. Did we run out of time? Is this failure repeatable? Do we have attempts left? Would waiting push us past the deadline? Only if every answer allows it does the loop sleep and try again. The function never throws a generic error; it returns a typed outcome the agent can pass to the model.
+
+### Why jitter matters
+
+Without randomness, every client that failed at the same moment retries at the same moment, producing a second synchronized wave against a dependency that is already struggling. Randomizing the delay inside the backoff window spreads the load. The practical effect is easy to see in a trace: retry spans from many runs no longer line up on the same timestamp.
+
+### What the sketch leaves out
+
+It does not honor a server's retry hint, does not share state between concurrent runs, and does not stop calling a dependency that is clearly down. The last gap has its own mechanism.
+
+## Phase five: stop hammering a dependency that is down
+
+Per-call retries {% highlight %}protect one run{% /highlight %}. They can hurt the system when a tool is failing for everyone, because every run keeps retrying and the dependency never gets room to recover.
+
+### Add a circuit breaker per tool
+
+A circuit breaker watches recent outcomes for a tool. When failures cross a threshold in a window, it opens: calls fail immediately with a typed "dependency unavailable" result for a cooldown period, then a small number of probe calls test recovery. This turns a thirty-second wait into an instant, honest answer and protects the dependency.
+
+| Breaker state | Behavior | Exit condition |
+| --- | --- | --- |
+| Closed | Calls pass through normally | Failure rate crosses threshold |
+| Open | Calls fail fast with a typed result | Cooldown elapses |
+| Half-open | A few probe calls are allowed | Probes succeed (close) or fail (reopen) |
+
+### Decide what the agent does when the circuit is open
+
+Failing fast is only half the answer. The agent needs a plan: use a fallback tool, answer from cached data with a stated caveat, defer the action, or tell the user plainly. Decide per tool, in advance. A fallback that quietly returns stale data without saying so is worse than an honest failure.
+
+> **Operating note:** Count a deliberate fail-fast from an open circuit differently from a real timeout in your metrics. Otherwise the breaker working correctly looks like an outage in your dashboards.
+
+## Read the lower half visually
+
+![A four-question path deciding whether a failed tool call may be retried](/media/ai-agent-tool-timeouts-and-retries-decision.svg)
+
+The diagram compresses the whole policy into the order of questions asked after any failure. A transient error comes first because a permanent one never deserves a retry. Safety to repeat comes second because it is the question with irreversible consequences. Budget and circuit state come last because they are about cost and system health rather than correctness. Reordering them is tempting, since budget checks are cheap, but putting safety later invites the habit of retrying first and thinking afterward.
+
+## Phase six: trace every attempt
+
+{% highlight %}A policy you cannot observe is a policy you cannot trust.{% /highlight %} The retry loop above should emit one span per attempt, not one span for the whole call, so that a trace shows the real shape of the delay.
+
+### Fields worth recording
+
+The field names below are a suggestion; align them with your own schema, and see the discussion of [what a trace schema should contain](/blog/ai-agent-trace-schema) for the wider set.
+
+| Field | Why it matters |
+| --- | --- |
+| tool name | Group behavior per tool |
+| attempt number | Shows how many tries a call needed |
+| attempt timeout and elapsed time | Shows whether the timeout was the cause |
+| failure class | Separates transient, permanent, and ambiguous |
+| will retry | Distinguishes a retried failure from a final one |
+| idempotency key | Lets you confirm repeats used the same key |
+| deadline remaining at start | Reveals budget starvation |
+| final outcome | Success, typed failure, or fail-fast |
+
+With the Uncoil SDK you can wrap a tool call in a step of type `tool` and attach this kind of detail as metadata, so each attempt becomes a child of the step that made it. Keep the metadata small and free of payload contents; record that a call happened and how it went, not the sensitive data it carried.
+
+### Questions a good trace answers in seconds
+
+- Which tool is responsible for most of the run's wall-clock time?
+- Of calls that needed a retry, how many succeeded on the second try, and how many never did?
+- Did any run hit its deadline before using its allowed attempts?
+- Did a non-idempotent tool get called more than once in a single run?
+
+The last question is the one to alert on. A single occurrence is a policy bug worth a same-day look.
+
+### Watch the retry rate, not only the error rate
+
+A healthy-looking final error rate can hide a rising retry rate. If calls succeed only on the second or third attempt, users are paying in latency and the dependency is paying in load, yet nothing is reported as failed. Track the share of calls that needed any retry and the average attempts per successful call. A climbing retry share is an early warning, usually well before errors appear.
+
+{% editorial-panel eyebrow="Diagnostic shortcut" title="Read the attempt spans left to right." body="Find the first attempt that is slower than its tool's normal range. Everything after it is a consequence. Fix or isolate that dependency before tuning delays or counts." tone="dark" /%}
+
+## Work through a realistic example
+
+Here is an illustrative scenario with invented numbers, meant to show the reasoning rather than report measurements.
+
+A support agent has a ticket tool with two operations: look up a ticket, and add a note to it. Lookup usually answers quickly. Adding a note is a write.
+
+The team sets: attempt timeout of eight seconds, step deadline of twenty, three attempts for lookup, and one attempt for adding a note because that call is not idempotent and the downstream API offers no key.
+
+Now a degraded afternoon. Lookup starts taking longer than the eight-second timeout on some calls.
+
+1. Attempt one for a lookup times out at eight seconds. Classification: ambiguous, but lookup is a read, so it is repeatable.
+2. The wrapper waits a jittered delay, then starts attempt two with the smaller of eight seconds and the twelve remaining.
+3. Attempt two succeeds in three seconds. The run continues with a trace showing two attempts and the first marked as a timeout.
+
+Then the note write times out at eight seconds. Classification: ambiguous, and the tool is non-idempotent. The wrapper does not retry. It returns a typed result saying the note may or may not have been saved. The agent's next step is a lookup of the ticket to check for the note, and only if it is missing does the agent ask the user before writing again.
+
+| Observation | Weak interpretation | Better next move |
+| --- | --- | --- |
+| Lookup timed out once, succeeded on retry | The tool is fine | Track the retry rate; note the latency drift |
+| Note write timed out | The write failed, so repeat it | Verify state with a read before any second write |
+| Three lookups in a row time out | Keep retrying | Open the circuit and use the stated fallback |
+
+{% highlight %}The pattern is the point.{% /highlight %} Reads absorb the failure by repeating. The write converts the failure into a verification step. Neither is clever; both are decided before the incident.
+
+### A tempting shortcut that fails
+
+The shortcut is a single global setting such as "retry three times with a ten second timeout" for every tool. It is easy to ship and wrong in both directions: it is too generous for the write, which should not repeat, and too rigid for a slow but valuable report generator that legitimately needs a minute. Per-tool policy takes slightly more work and avoids both failures.
+
+## Compare the trade-offs honestly
+
+Timeouts and retries trade several things against each other, and none of them is free.
+
+- **Latency versus success rate.** More attempts and longer timeouts raise the chance of eventual success and raise the worst-case wait. Pick the worst case you can defend to a user.
+- **Cost versus resilience.** Retried model-backed tools spend tokens or compute again. For paid downstream APIs, retries can add real cost, so count them.
+- **Load versus recovery.** Aggressive retries help one run and hurt a struggling dependency. Jitter and breakers shift the balance toward the system.
+- **Simplicity versus precision.** A global default is easy to explain. Per-tool policy is more accurate. A reasonable middle is a small number of named profiles, for example read, idempotent write, and sensitive write.
+
+A related lever is the service level you promise. If your agent has a stated reliability or latency objective, the retry policy is part of how you spend its error budget; the discussion of [error budgets for agents](/blog/ai-agent-slos-error-budgets) is a useful companion when you decide how much retry latency is acceptable.
+
+> **Release rule:** Do not ship a new tool without a written timeout, an attempt count, and an idempotency classification. A tool with defaults nobody chose has a policy anyway; you just do not know what it is.
+
+## Protect the security boundary
+
+Retry code sits between your agent and systems with real authority, so it needs the same care as any privileged path.
+
+### Do not retry authorization failures
+
+A 401 or 403 means the caller lacks access. Repeating it will not help, and rapid repeats against an authentication endpoint can trigger lockouts or look like probing. Fail immediately and report the class.
+
+### Keep secrets out of retry logs
+
+Retry spans tempt people to log the full request so they can replay it. Do not log credentials, tokens, or sensitive payloads. Record the tool name, attempt number, and failure class. If you need to replay a call, reconstruct it from the user's original request with a human in the loop, never from a stored secret.
+
+### Bound what the model can ask the wrapper to do
+
+Never let model output set the retry count, timeout, or idempotency key for a tool. Those values belong to configuration and to your code. {% highlight %}A model that can raise its own attempt limit can also be steered to do so{% /highlight %} by hostile input in a tool result. The policy is enforced outside the model.
+
+### What this approach deliberately cannot authorize
+
+Retry logic must never be the reason a sensitive action happens. Anything involving billing, account access, secrets, infrastructure, or deletion should require explicit approval at the action level, independent of how the call is retried. A retry wrapper that quietly re-runs a deletion after an ambiguous timeout is a defect, however well it classifies errors.
+
+## Know when this recommendation stops being right
+
+The patterns above assume short, synchronous tool calls. Three situations change the advice.
+
+- **Long-running operations.** Report generation or batch jobs should not be held open on one connection. Start the job, receive an identifier, and poll with its own timeouts. A single long timeout is the wrong tool.
+- **Streaming results.** When a tool streams, "no response" is no longer the only failure. Add an idle timeout between chunks so a stalled stream is noticed without cutting a healthy one.
+- **Human-facing latency budgets that are very tight.** If the user will wait only a couple of seconds, there may be no room for a retry at all. In that case, favor a fast fallback or a cached answer over a second attempt.
+
+Recognize these by their traces: very wide latency distributions, attempt spans that end for lack of idle activity, or deadlines exhausted before the second attempt starts.
+
+## Make the operating decision
+
+{% editorial-panel eyebrow="Decision room" title="Ship the policy, not the loop." body="What ships is a per-tool table of timeouts, attempt counts, and idempotency classes, plus the tracing that proves it works. What stays blocked is any non-idempotent tool without a verification step. The owner of each tool owns its row." tone="paper" /%}
+
+Carry the support example to a decision. Lookup ships with three attempts and a shared deadline. The note write ships with a single attempt and a verification step. The circuit breaker ships for lookup because its failures are shared across runs. The remaining open question, whether the ticket API can accept an idempotency key, is assigned to its owner, and until it is answered the write stays single-attempt. That is {% highlight %}a complete, reversible decision{% /highlight %}: any row can be loosened later when traces show the evidence.
+
+## Leave the reader with the next move: a checklist
+
+Use this as the release checklist for any agent tool.
+
+- [ ] Each tool has a per-attempt timeout chosen from measured latency, plus a step deadline and a run budget, with inner limits smaller than outer ones.
+- [ ] Exactly one layer owns retries for each tool, and the others are switched off.
+- [ ] Failures are classified as transient, permanent, or ambiguous, and permanent ones are never retried.
+- [ ] Every write is marked idempotent, keyed, or non-idempotent, and non-idempotent writes have a verification step instead of an automatic retry.
+- [ ] Backoff uses jitter, and a circuit breaker with a stated fallback protects shared dependencies.
+- [ ] Each attempt emits its own span with attempt number, elapsed time, failure class, and outcome, without secrets or payloads.
+- [ ] An alert fires when a non-idempotent tool is called twice in one run, and the retry rate is on a dashboard.
+- [ ] Anything touching billing, access, secrets, infrastructure, or deletion has explicit approval that does not depend on retry behavior.
+
+Start small. Pick the one tool that causes the most waiting in your traces, write its row in the policy table, add per-attempt spans, and read a week of data before touching the next one.
+
+## Frequently asked questions
+
+{% faq-item question="How many times should an agent retry a failed tool call?" answer="There is no universal number. Reads that fail transiently often tolerate two or three attempts within a shared step deadline. Non-idempotent writes should usually get one attempt plus a verification step. Let the time budget and the idempotency class decide, and let traces tell you whether extra attempts ever help." /%}
+{% faq-item question="Is a timeout the same as a failure?" answer="No. A timeout means you stopped waiting, not that the operation did not happen. For reads this distinction rarely matters. For writes it is the central risk, so treat a timed-out write as ambiguous and check state before repeating it." /%}
+{% faq-item question="Should the model decide whether to retry?" answer="The model can decide what to do after a typed failure, but it should not control retry counts, timeouts, or idempotency keys. Those are enforced in code. Telling the model clearly what already happened prevents it from blindly repeating a call." /%}
+{% faq-item question="How do I choose a timeout without guessing?" answer="Measure the tool's latency over a representative period, set the attempt timeout above its normal high-percentile range, and check how many healthy calls it would have cancelled. Then cap the total with a step deadline so attempts and delays cannot exceed what the user will tolerate." /%}
+{% faq-item question="What should I monitor to know the policy is working?" answer="Track the share of calls needing a retry, average attempts per successful call, runs that exhausted their deadline, fail-fast counts from open circuits, and any run where a non-idempotent tool was called more than once. A rising retry share usually appears before the error rate does." /%}
