@@ -76,7 +76,7 @@ Two notes on this table. First, categories blur: several open-source platforms a
 
 ### Where does Uncoil sit?
 
-In the interest of fairness, here is where the publisher of this blog sits. Uncoil is a managed, agent-focused platform. It ingests OpenTelemetry (OTLP) spans and has TypeScript and Python SDKs, offers an EU region, and is not open source: its SDKs and docs are public, but the platform is managed only. That means that if self-hosting is a hard requirement for you, Uncoil fails gate 3 and you should remove it from your shortlist. The checklist below is built so that it can say so.
+In the interest of fairness, here is where the publisher of this blog sits. Uncoil is an agent-focused platform with a managed option. It ingests OpenTelemetry (OTLP) spans and has TypeScript and Python SDKs, offers an EU region, and its code is MIT licensed and can be self-hosted. Self-hosting means setting up your own Convex backend and analytics database, as described in the docs, so it carries the operating cost covered under gate 3. If you want a managed platform with no servers to run, use the hosted option. The checklist below applies the same gates to every tool, Uncoil included.
 
 ## Gate one: can I see what my agents cost?
 
@@ -290,7 +290,7 @@ It does not replace security review. Monitoring tools receive prompts, tool argu
 
 It does not cover evaluation depth. Scoring quality, building datasets and release gates are a topic of their own, and the right tool for them may differ from the right tool for monitoring. If evaluation is your primary need, weight it as a gate of its own.
 
-It is written by a vendor. The publisher of this blog sells one of the products in this space. The checklist is built so that it can rule that product out, and the self-hosting gate does, but you should weigh that interest when you read any vendor-published comparison, including this one.
+It is written by a vendor. The publisher of this blog sells one of the products in this space. The checklist applies the same gates to that product as to every other, but you should weigh that interest when you read any vendor-published comparison, including this one.
 
 {% editorial-panel eyebrow="Decision room" title="Pick the tool that passes your hard gates and wins your weighted trial." body="Write the problem sentence, mark hard constraints, set weights, trial two tools on the same traffic and record friction. If the team can explain the choice in those four steps, the choice is defensible even if it later changes." tone="paper" /%}
 
