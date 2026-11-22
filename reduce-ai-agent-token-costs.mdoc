@@ -1,0 +1,289 @@
+---
+title: "How Do I Reduce AI Agent Token Costs? A Question-by-Question Guide"
+slug: reduce-ai-agent-token-costs
+excerpt: Answer the questions that decide an agent's token bill in order — where the tokens go, what to trim, what to cache, which steps need a smaller model, and where to put a cap — with a worked run you can check by hand.
+publishedAt: 2026-11-22T12:00:00.000Z
+author: Uncoil Team
+draft: true
+categories: [operations]
+tags: [token costs, LLM cost, AI agents, cost optimization]
+relatedPosts: [how-to-track-llm-token-usage, reduce-llm-costs-without-hurting-quality, context-window-management]
+heroImage:
+  src: /media/reduce-ai-agent-token-costs-hero.svg
+  alt: Twelve bars on a black field, one per agent step, each with the same cream base and a yellow block of re-sent history that grows taller at every step
+seo:
+  metaTitle: "How Do I Reduce AI Agent Token Costs? A Practical Guide"
+  metaDescription: Answer ten practical questions about agent token spend, from why costs grow with every step to trimming, caching, routing and capping, with a worked example you can verify.
+---
+
+{% trace-scenario title="Why did the same task cost three times more?" prompt="An agent resolves a support ticket in 6 steps on Monday and in 12 steps on Tuesday. The prompt, the model, and the tools are identical. Finance asks why Tuesday's run cost roughly three times as much, not twice." outcome="Each step re-sends the whole history, so input tokens grow faster than the step count. Twelve steps send far more than twice the input of six. The fix is rarely a cheaper model first. Count tokens per step, find what the history is carrying, and shorten the run or the history before touching quality." /%}
+
+An agent is a loop, and {% highlight %}a loop is billed every time it turns{% /highlight %}. If you run an agent in production and its token bill has become a line item someone asks about, this guide is for you. It is organised as the questions you will actually be asked, in the order that saves the most money for the least risk, and it carries one worked run through every answer so you can check the arithmetic yourself.
+
+## At a glance
+
+![Five cost levers in a row, count, trim, reuse, route and cap, ordered from lowest risk to a safety net](/media/reduce-ai-agent-token-costs-orientation.svg)
+
+*The five levers are ordered by risk. Counting changes nothing about behaviour, so it comes first. Capping is a safety net you keep in place after the others.*
+
+The job is to lower the tokens an agent spends per finished task without lowering the number of tasks it finishes correctly. The outcome is a short list of changes ranked by saving and risk, each one tied to a number you measured rather than a rule of thumb you read somewhere.
+
+The boundary is deliberate. This article covers the tokens an agent sends and receives. It does not cover negotiating provider contracts, buying committed capacity, or pricing your own product. It also does not repeat the full spend-attribution method in [reducing LLM costs without hurting quality](/blog/reduce-llm-costs-without-hurting-quality) or the instrumentation detail in [how to track LLM token usage per request, run and release](/blog/how-to-track-llm-token-usage). Read those for the surrounding practice. Here we answer one question: where do an agent's tokens go, and which of them can you stop paying for?
+
+### The operating model: count, trim, reuse, route, cap
+
+Five levers cover almost every real saving, and they work best in this order.
+
+| Lever | The question it answers | Typical risk to quality | Needs evaluation first |
+| --- | --- | --- | --- |
+| Count | Where do tokens go, per step and per run? | None | No |
+| Trim | What are we sending that the model does not need? | Low, if the dropped content is not referenced later | Light spot checks |
+| Reuse | Which part of the prompt is identical across calls? | Low, if cache lifetime and versions are handled | No, but check cache behaviour |
+| Route | Which steps could a smaller model do? | Real, and different per step | Yes |
+| Cap | What stops a runaway run from costing a fortune? | Failed runs, if the cap is too tight | Review the cap against real runs |
+
+Do not skip ahead. A team that routes to a smaller model before it has counted tokens usually discovers later that a single oversized tool result was most of the bill.
+
+## 1. Where do an agent's tokens actually go?
+
+Start with the cost formula for a run, because every lever acts on one of its terms.
+
+```text
+run cost = sum over steps of (input_tokens × input_rate + output_tokens × output_rate)
+input_tokens at step i = fixed_prompt + history_before_step_i
+```
+
+The fixed prompt is the system instructions, the tool definitions and the task. It is the same at every step. The history is everything the loop has accumulated: earlier model messages, tool calls, and above all tool results. The output is what the model writes at each step.
+
+Two facts follow, and both surprise teams the first time they plot them. First, the history term grows with every step, so total input grows roughly with the square of the step count. Second, output tokens are usually a small share of the volume even though providers commonly charge more for them per token. {% highlight %}Input dominates the bill in most agent loops{% /highlight %} because the loop re-sends it so many times.
+
+### A worked run you can check by hand
+
+Carry this illustrative run through the whole article. The rates are placeholders for the sake of arithmetic, not any provider's prices: input at $2, cached input at $0.50 and output at $8 per million tokens.
+
+- Fixed prompt: 3,500 tokens (instructions, tool definitions, the ticket).
+- Each step appends 1,200 tokens of history (a tool result plus the model's message).
+- The model writes 300 tokens per step.
+- The run takes 12 steps.
+
+Input at step 1 is 3,500. At step 12 it is 3,500 plus 11 × 1,200, which is 16,700. Summed over 12 steps, input is {% highlight %}121,200 tokens{% /highlight %}, of which 79,200 is history re-sent. Output is 3,600 tokens. At the placeholder rates, input costs about $0.2424 and output about $0.0288, for a run total of about $0.2712.
+
+Notice what the numbers say. {% highlight %}History is roughly 65 percent of all input.{% /highlight %} Output is under 3 percent of the tokens and about 11 percent of the cost. The thing worth attacking is the history, not the answer.
+
+> **Note:** These figures are a model of a loop, not a measurement of yours. Your fixed prompt, your per-step growth and your step count will differ. The point of the exercise is the shape: input grows faster than steps, and history is the term that grows.
+
+### What this answer does not tell you
+
+It does not tell you which step is the expensive one or why the run took 12 steps. That needs a trace. The next question is how to get one.
+
+## 2. How do I see token use per step instead of per month?
+
+A monthly invoice tells you the total. A per-step record tells you what to change. The minimum you need on every model call is the model identifier, input tokens, output tokens, and a link to the run and step that made the call. With those four fields you can reproduce the table above from your own data.
+
+With the Uncoil SDK you record this on a span. The pattern below follows the documented `step.set` call for TypeScript; the `priceFor` function is yours, built from your own current provider rates, because Uncoil does not guess a price. If you do not pass a cost it stays zero.
+
+```ts
+await span(
+  "chat",
+  async (step) => {
+    const reply = await callModel(messages);
+    step.set({
+      model: "your-model-id",
+      inputTokens: reply.usage.input,
+      outputTokens: reply.usage.output,
+      costUsd: priceFor(reply.usage),
+    });
+    return reply.text;
+  },
+  { type: "llm" },
+);
+```
+
+With a wrapped provider client you supply a `calculateCost` function once instead of calling `step.set` yourself. See the cost tracking documentation for the exact options for your provider. Whatever you use, tag runs with environment and release metadata so you can compare a change against the version before it.
+
+### Read the cost view the right way
+
+Once spans carry tokens and cost, the cost view groups spend by model, by tool and by day, and by end user where you set a user identifier. Use those groupings as questions. Which model is most of the spend? Which tool's results are the largest? Is one end user far above the rest? The answers point to a lever: a dominant model suggests routing, a heavy tool suggests trimming its output, and one heavy user suggests a cap.
+
+> **Decision rule:** Do not change anything until you can name the most expensive step type and say what share of run cost it carries. A saving you cannot attribute to a step is a guess.
+
+## 3. Why does my cost per task keep creeping up?
+
+Creep has four common causes, and each leaves a different fingerprint in the per-step data.
+
+| Symptom in the trace | Likely cause | First check |
+| --- | --- | --- |
+| Input tokens climb steeply across steps | History is growing unbounded | Plot input tokens against step number for one run |
+| One step is far larger than its neighbours | An oversized tool result entered the history | Look at the raw tool output size at that step |
+| Step count rises over weeks | The agent retries or loops more | Compare steps per run by release |
+| Fixed prompt grows between releases | Instructions and tool definitions accumulated | Diff the system prompt and tool list across versions |
+
+### Step count is a cost multiplier
+
+Because {% highlight %}input grows with the square of steps{% /highlight %}, a modest rise in average step count has an outsized cost effect. In the worked run, stopping at 6 steps instead of 12 cuts input from 121,200 to 39,000 tokens, a reduction of about 68 percent for half the steps. If you can remove avoidable steps, you save more than the step count suggests. Avoidable steps often come from failed tool calls and vague tool errors, which is why [tool calling reliability](/blog/tool-calling-reliability) is a cost topic as well as a quality one.
+
+## 4. What can I trim without hurting quality?
+
+Trimming means sending the model less of what it does not need. It is the cheapest lever after counting because it needs no new infrastructure, and it attacks the term that dominates the bill.
+
+### Shrink tool results at the source
+
+A tool that returns a whole document, a full database row set or an unfiltered API payload puts all of it into the history, and the loop then re-sends it at every later step. Ask each tool to return only what the model decides with. Filter fields, cap list lengths and return identifiers the model can fetch on demand instead of full bodies. In the worked run, cutting the per-step addition from 1,200 to 400 tokens drops input from 121,200 to 68,400 and the run cost from about $0.2712 to about $0.1656.
+
+### Limit how much history you carry
+
+Old history is the other target. Three strategies are common: drop the oldest steps, replace old steps with a short summary, or keep only the steps the current plan refers to. In the worked run, keeping only the last 4 steps of history brings input down to 87,600 tokens and cost to about $0.2040. Summarising costs extra tokens to produce the summary, so check that the saving survives that cost. The longer treatment of these strategies is in [context window management for long-running agents](/blog/context-window-management).
+
+### Cut the fixed prompt last
+
+The fixed prompt is paid at every step, so a 500-token reduction is worth 500 tokens times the step count. That is real, but it is also where trimming is riskiest, because instructions and tool definitions carry behaviour. Remove only what you have evidence the agent never uses, such as tool definitions for tools that no trace has called in weeks, and test the change.
+
+> **Warning:** Dropping history is safe only if nothing later depends on it. An agent that must remember a constraint stated in step 2 will fail quietly at step 9 if you trimmed step 2. Pin the facts the task needs into a short running note that you always keep, and trim around it.
+
+{% editorial-panel eyebrow="Operating principle" title="Trim the term that grows, not the term that is easy." body="Output tokens are visible and tempting to cut, but history is the larger and faster-growing share of input. Measure first, then trim tool results and old steps before shortening answers." tone="yellow" /%}
+
+## 5. How does prompt caching reduce the bill?
+
+Many providers let you pay a lower rate for input tokens that repeat a recently seen prefix. Whether a provider offers this, at what rate, how long the cache lives and what a cache write costs all differ and change over time, so read your provider's current documentation and treat every number in this article as a placeholder.
+
+### What makes a prefix cacheable
+
+Caching works on a stable prefix. The fixed prompt, the tool definitions and a stable task description are identical at every step, so they are the natural candidates. Anything that changes the prefix, such as a timestamp near the top, a reordered tool list or a per-request identifier placed before the instructions, can prevent the cache from matching. Put stable content first and variable content last.
+
+### Work out the saving before you rely on it
+
+In the worked run, with the 3,500-token prefix billed at the cached rate from step 2 onward, 38,500 tokens move to the cheaper rate and the run cost falls from about $0.2712 to about $0.2135. Combining the cached prefix with the 4-step history limit brings it to about $0.1462. The saving from caching is real but {% highlight %}smaller than the saving from trimming{% /highlight %} here, because the history, which caching does not touch, is most of the input.
+
+The Uncoil documentation on prompt caching makes a separate point worth keeping: caching must not hide which prompt version a run used. Keep the prompt version on the span even when the content came from a cache, and bypass or invalidate the cache when you promote a new prompt, or you will compare a new prompt against an old cached one.
+
+### Where caching does not help
+
+A cache does nothing for the growing history, for output tokens, or for short runs where the prefix is only paid a few times. It also does not remove the cost of the first call. If your agent runs rarely enough that the cache expires between runs, you may pay the full rate every time. Check the cache hit rate on real traffic before counting the saving.
+
+For caching whole responses rather than prompt prefixes, [semantic caching for LLM applications](/blog/semantic-caching-llm-applications) explains when it is safe and when a similarity match ships the wrong answer. That is a different mechanism with different risks.
+
+## 6. Which steps can use a smaller model?
+
+Routing sends each step to the cheapest model that does that step well enough. Unlike trimming and caching, it changes the model's behaviour, so it is the first lever that needs evidence of quality.
+
+### Choose steps by what they demand
+
+Steps that classify, extract a field, reformat output or choose among a few tools often tolerate a smaller model. Steps that plan, reconcile conflicting evidence or write the final answer usually do not. Do not route by a general feeling about difficulty. Route by measured pass rate on a fixed set of examples for that step.
+
+| Step type | Tends to suit a smaller model | Why the answer might be wrong |
+| --- | --- | --- |
+| Classify intent or priority | Often | Edge cases and rare categories |
+| Extract fields into a schema | Often | Subtle formats and missing values |
+| Choose the next tool | Sometimes | Wrong tool choice compounds into extra steps |
+| Plan a multi-step task | Rarely | Poor plans lengthen the run and cost more overall |
+| Compose the final answer | Rarely | Visible to the user and hardest to regress safely |
+
+### Count the cost of a wrong route
+
+A cheaper model that makes a worse tool choice can lengthen the run, and a longer run costs more through the history term. The fair comparison is cost per successful task, not cost per call. The mechanics of choosing and observing routes are covered in [LLM gateway and model routing](/blog/llm-gateway-model-routing).
+
+> **Decision rule:** Route a step to a smaller model only when it matches the larger model's pass rate on your own examples for that step, and when cost per successful task, not cost per call, goes down.
+
+## 7. How do I stop a runaway run?
+
+{% highlight %}A cap is a safety net, not a saving you plan around.{% /highlight %} Its job is to limit the damage from the rare run that loops, retries without end or meets an unexpectedly large input.
+
+### Pick the caps that matter
+
+Three limits cover most failure modes: a maximum number of steps per run, a maximum token total per run, and an alert on cost per window. A step limit stops a loop even when each step is cheap. A token limit stops a single huge input. An alert tells a human when something is wrong without killing a legitimate large run.
+
+In Uncoil you can create alert rules from the project's Alerts page on a metric such as cost over a time window, with an optional environment filter and destinations such as email, Slack or a webhook. Rules are checked about every five minutes, so treat an alert as a prompt for a human, not a hard stop. A hard stop belongs in your own loop code.
+
+```ts
+// Illustrative: a hard limit enforced inside your own agent loop.
+type Limits = { maxSteps: number; maxTotalTokens: number };
+
+export function shouldStop(step: number, tokensSoFar: number, limits: Limits) {
+  if (step >= limits.maxSteps) return "step-limit";
+  if (tokensSoFar >= limits.maxTotalTokens) return "token-limit";
+  return null;
+}
+
+// Return a clear failure to the caller; never silently truncate the task.
+```
+
+### Decide what a stopped run does
+
+A stop must end in a defined state: return a partial result with a clear reason, hand the case to a person, or retry with a smaller plan. Silently ending the run and reporting success hides the failure and makes your cost per successful task look better than it is.
+
+## 8. How do I attribute the cost to a team, feature or customer?
+
+Attribution tells you who to talk to. If one feature or one customer drives most of the spend, the fix is usually a product decision, such as a different plan limit, not an engineering trick. Record an identifier for the feature and the end user on the run, and use the by-user and by-tool views to find concentration. The full method for pooled spend across tenants, including how to reconcile against an invoice, is in [AI agent cost attribution](/blog/ai-agent-cost-attribution).
+
+## 9. How do I know a change saved money without breaking anything?
+
+Treat each change as an experiment with two numbers: cost per successful task and a quality measure on the same examples. Savings that lower cost while lowering success rate are not savings.
+
+### The minimum safe experiment
+
+1. Pick one change and one set of representative tasks.
+2. Run before and after on the same tasks, with the same environment and a release tag on each.
+3. Compare cost per successful task, steps per run, failure rate and a quality score.
+4. Keep the change only if cost falls and quality holds within the margin you set in advance.
+5. Keep the previous version available so you can roll back.
+
+Small samples mislead. A saving seen on five runs may be noise from step-count variance, which, as we saw, moves cost sharply. Prefer enough runs that the spread between them is small compared with the difference you claim.
+
+## 10. What changes the answer?
+
+Everything above assumes input dominates and history is the growing term. That is typical of tool-using loops, but it is not universal.
+
+### When the advice stops applying
+
+- Single-call features with no loop have no history term. Trimming the prompt and caching the prefix still help, but step count is irrelevant.
+- Output-heavy tasks, such as long document generation, shift the cost to output tokens. There, shortening or structuring the answer matters more than trimming history. [Structured outputs for AI agents](/blog/structured-outputs-ai-agents) is a better starting point.
+- Very short runs of two or three steps leave little history to trim and little prefix reuse to gain.
+- Latency-sensitive features may accept a higher token cost for speed. Cost and latency pull in different directions, as [LLM latency optimization](/blog/llm-latency-optimization) explains.
+
+## Read the lower half visually
+
+![Horizontal bars showing the illustrative cost of one 12-step run: a long yellow baseline bar and shorter bars for lean tool results, a cached prefix, trimmed history, trimming plus caching, and stopping at six steps](/media/reduce-ai-agent-token-costs-scenarios.svg)
+
+*The same illustrative run under six changes. Changes that reduce history or steps beat changes that only reduce the price of the prefix. The rates are placeholders.*
+
+The chart repeats the lesson of the arithmetic. The largest reductions come from {% highlight %}sending less history and taking fewer steps{% /highlight %}. Caching helps, and combined with trimming it helps more, but no single lever is free of a condition: trimming needs a pinned note, caching needs a stable prefix and a high hit rate, routing needs evaluation, and a cap needs a defined stop.
+
+### Security and privacy boundaries
+
+Tokens are text, and text can contain customer data. Trimming and summarising change what is stored in traces and what is sent to the provider, so check your redaction rules after you change them. A summary can leak a detail the original redaction would have removed. A cache that stores prompt content should respect tenant boundaries so one customer's content is never served in another's context. A hard cap should never disable the safety checks that protect your users. Cost control must not authorise skipping them.
+
+{% editorial-panel eyebrow="Decision room" title="Ship the smallest change that moves the biggest measured term." body="Rank changes by saving per unit of risk. Count first, trim the history, cache the stable prefix, and route only the steps you have evidence for. Keep a cap in place throughout." tone="dark" /%}
+
+## Worked decision: what would we ship?
+
+Return to the run that cost about $0.2712. The per-step data shows history is 65 percent of input and tool results are the largest addition. The decision, in order:
+
+1. Shrink the tool results from 1,200 to roughly 400 tokens per step. Expected run cost about $0.1656, with a spot check that the model still has the fields it decides on.
+2. Cap carried history at the last 4 steps plus a pinned note. Re-measure after step 1, because the saving from trimming shrinks once tool results are smaller.
+3. Order the prompt so the stable prefix comes first, and confirm the cache hit rate on real traffic before counting the saving.
+4. Leave routing for later. Without a per-step pass-rate comparison, a routing change is a gamble.
+5. Add a step limit and a cost alert, and define the stop behaviour.
+
+{% highlight %}The savings are not additive.{% /highlight %} Each change shrinks the base the next one works on, so re-measure after every step instead of adding up the estimates. This is why the sequence matters: the first change you make changes the value of the second. For the wider cost-per-task method, see [reducing LLM costs without hurting quality](/blog/reduce-llm-costs-without-hurting-quality).
+
+## Checklist: your next move
+
+- [ ] Every model call records model, input tokens, output tokens, run and step.
+- [ ] You can name the most expensive step type and its share of run cost.
+- [ ] Input tokens per step are plotted for at least one long run.
+- [ ] Tool results are limited to the fields the model decides with.
+- [ ] History is bounded, with a pinned note for facts the task needs.
+- [ ] The stable prefix is first in the prompt, and the cache hit rate is checked on real traffic.
+- [ ] Any routed step has a measured pass rate against the larger model on your own examples.
+- [ ] A step limit, a token limit and a cost alert exist, and a stopped run ends in a defined state.
+- [ ] Each change was compared on cost per successful task and a quality measure, with a rollback ready.
+
+Pick one lever, apply it to one agent, and measure before and after. If you do only one thing this week, plot input tokens against step number for your longest recent run. The shape of that curve will tell you which question in this guide to answer first.
+
+## Frequently asked questions
+
+{% faq-item question="What is the fastest way to cut agent token costs?" answer="Shrink what tool results put into the history and cap how much old history you carry. In a typical tool-using loop the re-sent history is the largest and fastest-growing share of input tokens, so trimming it saves more than shortening answers or negotiating a rate. Count tokens per step first so you know it applies to your agent." /%}
+{% faq-item question="Does prompt caching make agents cheap on its own?" answer="Not by itself. Caching lowers the price of a repeated prefix, but it does not reduce the growing history, the output tokens or the number of steps. Its saving depends on your provider's current terms, how long the cache lives and your real hit rate, so measure it on live traffic and treat any example rate as a placeholder." /%}
+{% faq-item question="Is it safe to switch to a smaller model for every step?" answer="No. Smaller models often handle classification, extraction and reformatting, but a weaker plan or tool choice can lengthen the run and raise the total cost. Route one step at a time, compare pass rate on your own examples, and judge the change by cost per successful task rather than cost per call." /%}
+{% faq-item question="How do I stop one run from costing far more than expected?" answer="Enforce a maximum step count and a maximum token total inside your own loop, and add a cost alert so a person is told when spend crosses a limit. Alerts are checked on a schedule, so they inform a human rather than act as a hard stop. Make a stopped run end with a clear reason instead of a silent success." /%}
+{% faq-item question="How do I know my savings are real?" answer="Compare cost per successful task and a quality measure on the same representative tasks before and after each change, tagged by release. A lower cost with a lower success rate is not a saving. Use enough runs that normal variation in step count does not hide or fake the difference, and keep the old version ready for rollback." /%}
