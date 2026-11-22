@@ -1,0 +1,320 @@
+---
+title: "How Do I Choose an AI Agent Monitoring Tool? A Neutral Checklist"
+slug: how-to-choose-ai-agent-monitoring-tool
+excerpt: A question-by-question guide to choosing an AI agent monitoring tool. Score cost view, trace depth, self-hosting, pricing and SDK support against your own constraints, then test the shortlist on real traffic.
+publishedAt: "2026-11-22T12:00:00.000Z"
+author: Uncoil Team
+draft: true
+categories:
+  - engineering
+  - guides
+tags:
+  - AI agent monitoring
+  - tool selection
+  - observability
+  - evaluation checklist
+relatedPosts:
+  - ai-agent-monitoring
+  - ai-agent-cost-attribution
+heroImage:
+  src: /media/how-to-choose-ai-agent-monitoring-tool-hero.svg
+  alt: A single yellow checklist card held up against five dark panels labelled cost, trace depth, hosting, pricing and SDK, each panel showing a different tool outline being measured against the same ruler
+seo:
+  metaTitle: "How Do I Choose an AI Agent Monitoring Tool?"
+  metaDescription: A neutral checklist for choosing an AI agent monitoring tool, covering cost view, trace depth, self-hosting, pricing and SDK support, with a one-week trial method.
+---
+
+{% trace-scenario title="Which tool should the team trial first?" prompt="Your agent has been live for a month. Support says some answers are wrong, finance says the model bill doubled, and an engineer says a tool call retries forever. Three monitoring products look similar on their landing pages, and you have one week to pick." outcome="Do not start with the feature grid. Start by writing down which of the three problems costs you most, where your data is allowed to live, and how your code is instrumented. Those answers eliminate most options before any trial, and the rest of this guide turns them into a checklist you can score." /%}
+
+Choosing an AI agent monitoring tool is a buying decision that behaves like an engineering decision. The product you pick decides what you can see when an agent misbehaves, how fast you can answer a finance question about spend, and how much work it is to leave later. This guide is written for the engineer or technical lead who has to recommend one tool and defend the recommendation. It is organised as the questions you should ask, in the order that eliminates options fastest.
+
+The boundary matters. This guide compares **categories of tool** against **your constraints**. It does not rank products, and it does not replace a trial on your own traffic. Where it states facts about specific kinds of product, those facts come from the public comparison pages at [/compare](/compare), which are written conservatively and carry a date for when each vendor's public pages were read. Vendors change plans and licences, so treat every number here as a starting point to re-verify.
+
+## At a glance
+
+![A decision map with five question gates in a row: cost view, trace depth, hosting, pricing, SDK. Each gate has a pass and a fail path, and a funnel narrows a long tool list down to a short list of two](/media/how-to-choose-ai-agent-monitoring-tool-gates.svg)
+
+The short version: there is no best tool, only a best fit for a constraint set. Most teams get this wrong by comparing features first and constraints second. Reverse that order. A {% highlight %}hard constraint removes a tool before any feature comparison starts{% /highlight %}, so find the hard constraints first and spend your trial time on the survivors.
+
+### The five-gate model
+
+This guide uses one model, the five-gate model. Each gate is a question with a pass condition you can test, not a feature you tick.
+
+| Gate | The question | What a pass looks like |
+| --- | --- | --- |
+| 1. Cost view | Can I see money per run, per tool and per tenant? | A run view that shows tokens and cost nested under the run that caused them |
+| 2. Trace depth | Can I follow one run from request to final answer? | Model calls and tool calls shown in order, with inputs, outputs and latency |
+| 3. Hosting | Where does my data live and who operates the system? | A deployment option that satisfies your data and operations rules |
+| 4. Pricing | What will it cost at my volume, not the demo volume? | A bill you can predict from your own span or trace counts |
+| 5. SDK support | How much code do I change, and can I leave? | Standard ingestion, or an SDK for your language and framework |
+
+Run the gates in order of how hard they are to fix. Hosting and SDK support are usually structural, so they come first in practice even though the table lists cost view first. The rest of the article goes through each gate and then shows how to combine the scores.
+
+## Why not just pick the tool with the longest feature list?
+
+A long feature list tells you what a vendor built. It does not tell you whether you need it. Agent monitoring products overlap heavily on the headline features: tracing, cost tracking, evaluation, prompts, alerts. The differences that matter live underneath those names. One product's "cost tracking" is a monthly total, another's is cost per run with a breakdown by tool call. The label is the same and the usefulness is not.
+
+There is a second trap. Feature lists reward breadth, while your problem is usually narrow. If your worst problem is runaway spend from a retrying tool, you need cost attached to individual runs and an alert. A prompt library, however polished, does not help that week. Write the problem down in one sentence before you read a single product page, and score every tool against that sentence.
+
+> **Field note:** Keep the one-sentence problem statement in the shared document where you record scores. When the team drifts toward a tool because a demo was impressive, read the sentence aloud. If the demo did not touch it, the demo was entertainment.
+
+For background on what a monitoring tool is supposed to watch, the guide to [AI agent monitoring](/blog/ai-agent-monitoring) covers the signals that matter in production. This article assumes you know them and are choosing a place to collect them.
+
+## Which kind of tool are you actually choosing between?
+
+Before scoring individual products, sort the field into categories. Products in one category compete on the same axes, and products in different categories solve different problems. The comparison pages describe at least five shapes, and most shortlists contain two or three of them.
+
+| Category | Typical strength | Typical trade-off | Fits when |
+| --- | --- | --- | --- |
+| Open-source, self-hostable platform | You can read the source and run it yourself | You operate the servers, upgrades and storage | Data must stay in your network, or you want to modify the tool |
+| Managed agent-focused platform | Runs, tool calls, cost and alerts without servers to operate | Hosting choices are the vendor's; usually no self-hosting | Agents are your main workload and the team is small |
+| Framework-native platform | Tightest fit with one agent framework from its maintainers | Value drops if you use several frameworks | Your stack is almost entirely one framework |
+| Evaluation-first platform | Datasets, scoring and side-by-side experiments | Production monitoring may be secondary | Quality scoring is your top priority |
+| General observability suite with an LLM add-on | One pane of glass across infrastructure and AI | Agent-specific views may be generic | The whole company already standardises on it |
+
+Two notes on this table. First, categories blur: several open-source platforms also offer a hosted cloud, so "self-hostable" does not mean "must self-host". Second, an open-source licence is not one thing. The comparison pages record MIT, Apache-2.0 and a source-available licence among the options, and those carry different rights. If licence terms matter to you, read the licence itself.
+
+### Where does Uncoil sit?
+
+In the interest of fairness, here is where the publisher of this blog sits. Uncoil is a managed, agent-focused platform. It ingests OpenTelemetry (OTLP) spans and has TypeScript and Python SDKs, offers an EU region, and is not open source: its SDKs and docs are public, but the platform is managed only. That means that if self-hosting is a hard requirement for you, Uncoil fails gate 3 and you should remove it from your shortlist. The checklist below is built so that it can say so.
+
+## Gate one: can I see what my agents cost?
+
+Cost visibility is the gate teams underestimate, because every tool shows a total. A total tells you the bill grew. It cannot tell you which agent, tenant, tool or retry caused it. The useful question is {% highlight %}whether cost is attached to the same object you debug{% /highlight %}, which is the run.
+
+Ask these five questions of any tool, in the trial, with your own data:
+
+1. Does each run show its token counts and its cost?
+2. Can I see cost split by model call and by tool call within the run?
+3. Can I filter or group cost by something I care about, such as tenant, feature or customer?
+4. Can I set an alert on cost, and what does it check and how often?
+5. Does the tool price models from a table it maintains, or do I supply prices?
+
+The last question hides a real trade-off. A tool that maintains a price table saves work but can lag a provider's price change or miss a new model. A tool where you supply prices is accurate to what you configured and costs you maintenance. Neither is wrong. Know which you are getting. The guide on [AI agent cost attribution](/blog/ai-agent-cost-attribution) explains why tagging cost at the span, at call time, is what makes tenant-level answers possible later.
+
+{% editorial-panel eyebrow="Gate one rule" title="Cost that is not attached to a run is a total, not a view." body="Test it by asking for the most expensive single run last week. If the tool can show that run with its model and tool calls and the cost of each, the cost view is real. If it can only show a daily chart, it is a total." tone="yellow" /%}
+
+### What to do when cost visibility is partial
+
+Some tools show tokens but not currency, or show cost for model calls but not for paid tools. Partial is not disqualifying if you can fill the gap. You can compute cost yourself from token counts and a price table you control, as the next code block shows. What you cannot easily recover later is data the tool never captured, so check that token counts are recorded per call, not only per run.
+
+```ts
+// Illustrative: compute cost from recorded token counts and your own price table.
+// Prices are placeholders; use the current prices from your provider.
+type Usage = { model: string; inputTokens: number; outputTokens: number };
+
+const pricePerMillion: Record<string, { input: number; output: number }> = {
+  "example-small": { input: 0.5, output: 1.5 },
+  "example-large": { input: 5, output: 15 },
+};
+
+export function callCost(u: Usage): number {
+  const p = pricePerMillion[u.model];
+  if (!p) throw new Error(`No price configured for model: ${u.model}`);
+  return (u.inputTokens * p.input + u.outputTokens * p.output) / 1_000_000;
+}
+```
+
+The function throws on an unknown model instead of returning zero. That is deliberate: a silent zero makes a new model look free and hides exactly the cost surprise you were trying to catch. If a tool you are trialling handles an unknown model by showing zero, note it as a finding.
+
+## Gate two: can I follow one run from request to answer?
+
+Trace depth is the gate that decides whether you can debug. A monitoring tool is useful during an incident only if it lets you start at a bad answer and walk backward to the step that caused it. For an agent, that means seeing the run as a tree: the request, each model call, each tool call with its arguments and result, retries, and the final output, in order, with latency on each.
+
+The test is simple and unforgiving. Take a real failed run from your logs and ask someone who did not build the agent to explain what happened using only the tool. Time it. If they can find the failing step in a few minutes, the trace depth is adequate. If they need to open the code, the tool is showing you telemetry, not a trace.
+
+### What "depth" should include
+
+Depth is not only nesting. These are the fields that change a debugging decision, and a good [trace schema](/blog/ai-agent-trace-schema) records all of them:
+
+| Field | Why it matters in debugging |
+| --- | --- |
+| Parent and child relationships | Tells you which tool call belonged to which model decision |
+| Inputs and outputs per step | Lets you see the bad argument, not only the bad result |
+| Retry and attempt number | Separates one slow call from a loop of five |
+| Latency per step | Shows where the time went, not only the total |
+| Error type and message | Distinguishes a timeout from a validation failure |
+| Session or conversation id | Connects a bad answer to the turns that preceded it |
+
+If you are new to the vocabulary, [LLM tracing explained](/blog/llm-tracing-explained) walks through spans, traces and sessions from scratch. Pay particular attention to how a tool treats data you consider sensitive. Inputs and outputs are valuable for debugging and risky to store, so ask what redaction and masking options exist before you send production prompts anywhere.
+
+> **Decision rule:** If a tool cannot show a single run's model calls and tool calls in order with their inputs and outputs, remove it from the shortlist for agent work, whatever else it offers.
+
+## Gate three: where does my data live, and who operates it?
+
+Hosting is a structural gate. {% highlight %}It is the one most likely to eliminate a tool outright{% /highlight %}, and it is hard to reverse, so decide it early. There are three questions inside it, and they are separate.
+
+The first question is about **data location**. Does your policy, contract or regulator require data to stay in a region, such as the EU? Some managed platforms offer regional hosting, and the comparison pages list several, including a managed EU region for Uncoil and multiple regions for some alternatives. If you need a particular region, ask whether it is available on the plan you will actually buy, not only on the highest tier.
+
+The second question is about **operations**. Self-hosting an open-source platform gives you control and costs you operational work: provisioning, upgrades, backups, storage growth and an on-call rotation for the monitoring system itself. That cost is real and often missing from the price comparison. A free tool you run yourself is free of licence fees, not of effort.
+
+The third question is about **control of the source**. Some teams need to read or modify the code. That is a legitimate reason to prefer open source, and it is a separate reason from data location. Write down which of the three is yours, because the answers lead to different tools.
+
+{% editorial-panel eyebrow="Gate three rule" title="Decide who gets paged when the monitoring tool is down." body="A managed platform moves that burden to the vendor. A self-hosted platform moves it to you. Neither is better in general, but the answer changes your staffing, so make the choice on purpose." tone="dark" /%}
+
+### Can I mix hosting models?
+
+Yes, and many teams do. Because OpenTelemetry is a standard, you can in principle send the same spans to more than one destination. A team might self-host an open-source tool for sensitive internal traffic and use a managed platform for a customer-facing agent. Mixed setups cost more attention, so use them only when two constraints genuinely conflict.
+
+## Gate four: what will it cost at my volume?
+
+Pricing is where comparisons most often go wrong, because vendors count different things. The comparison pages call this out explicitly: one platform bills in units, another in spans, another in traces or requests, and a unit is not a span. A price per unit cannot be compared to a price per span until you convert both to your own traffic.
+
+For reference, the public plan facts on the comparison pages, read on the dates they state, include: Uncoil's Free plan at $0 with 10k spans a month and 7 days of history, Pro at $19 a month with 500k spans and 30 days, and Team at $39 a month with 2m spans and 90 days. Other products on those pages bill per seat, per trace or per unit, with different history windows, from a few days up to years. Those are facts about different billing shapes, not a ranking.
+
+### How to compare pricing fairly
+
+1. Measure your own volume. Count the spans, traces or requests your agent emits in a typical week, including retries and tool calls.
+2. Convert each vendor's unit to your measurement. Read what a unit includes and write the conversion down.
+3. Add seats if the plan is per seat, and multiply by the team size you will have in a year, not today.
+4. Add retention. A longer history window is worth money if you debug old incidents or need audit evidence.
+5. Add the cost of operating the tool, if self-hosted.
+6. Model growth. A plan that is cheap at 100k spans may not be at 5m.
+
+| Billing shape | Predictable when | Surprises when |
+| --- | --- | --- |
+| Flat monthly with an included volume | Your volume sits inside the allowance | You cross the allowance and learn the overage rule |
+| Per seat | Team size is stable and small | More people need access to debug |
+| Per unit, per trace or per request | You know what one unit contains | Retries and tool calls multiply the count |
+| Self-hosted, no licence fee | You already run similar infrastructure | Storage and on-call effort grow with volume |
+
+{% highlight %}Price your own traffic, not the demo traffic{% /highlight %}. A plan that looks generous for a prototype can look different once an agent makes twenty calls per user request.
+
+## Gate five: how much code do I change, and can I leave?
+
+SDK support is about two things: the cost of getting data in and the cost of getting out. Both are easy to ignore until they bite.
+
+For getting data in, the cleanest option is a standard. OpenTelemetry is a vendor-neutral way to emit spans, and several products on the comparison pages accept OTLP over HTTP. Uncoil accepts spans over OTLP, so OpenTelemetry-instrumented code can send traces without a proprietary SDK, and the TypeScript and Python SDKs are optional. If a tool needs its own SDK, check that it supports your language and your agent framework, and check what happens when your framework releases a new version. The explanation in [OpenTelemetry tracing for LLMs](/blog/opentelemetry-llm-tracing) shows what standard instrumentation looks like for model calls.
+
+For getting out, the question is how locked in you become. A tool built on a standard lets you change destination by changing an exporter. A tool with a proprietary SDK ties your instrumentation to the vendor. History is the other half: the comparison pages note that history does not generally move between products, so export what you need before you switch off an old tool.
+
+```ts
+// Illustrative: the exit-cost test. If switching destinations only changes the
+// exporter configuration, instrumentation is not locked to a vendor.
+const exporterConfig = {
+  url: process.env.TRACE_ENDPOINT, // change this to change destination
+  headers: { authorization: `Bearer ${process.env.TRACE_API_KEY}` },
+};
+// Your span-creating code stays the same either way.
+```
+
+> **Field note:** Ask every vendor the same question: "If I leave in a year, what do I have to rewrite?" The honest answers range from "change a URL and a key" to "replace your instrumentation". Both are useful information.
+
+### Framework fit
+
+If your stack is mostly one agent framework, a tool from that framework's maintainers can fit tightly, and the comparison pages say so plainly. If you use several frameworks or call model providers directly, a framework-neutral tool avoids maintaining several integrations. Check the vendor's list of supported frameworks against yours, and test the one you use most, not the first one on the list.
+
+## How do I combine the five gates into a decision?
+
+You now have five gates. Combining them takes two steps: separate hard constraints from preferences, then weight the preferences by how much they hurt if missed.
+
+Hard constraints are gates where a fail ends the conversation: a required self-hosted deployment, a required region, a language with no SDK and no OTLP path. Mark each tool pass or fail on those and remove failures. What remains are preferences, which you score.
+
+| Gate | Weight (example) | Tool A | Tool B | Tool C |
+| --- | --- | --- | --- | --- |
+| Cost view | 3 | 2 | 3 | 1 |
+| Trace depth | 3 | 3 | 2 | 3 |
+| Hosting fit | 2 | 3 | 1 | 3 |
+| Pricing at volume | 2 | 2 | 3 | 2 |
+| SDK and exit cost | 1 | 3 | 2 | 2 |
+
+The weights and scores above are illustrative numbers to show the method, not measurements of any product. Multiply each score by its weight and add the row totals. The point of the arithmetic is not precision. It is forcing the team to agree on weights before the scores arrive, so nobody can tune the weights to justify a favourite.
+
+### A small scoring helper
+
+Keep the scoring in code or a spreadsheet so it is repeatable. The helper below treats a missing score as a failure to evaluate, not as zero, because a gap in your evidence is different from a bad result.
+
+```ts
+// Illustrative: weighted scoring where hard constraints remove a tool first.
+type Scores = Record<string, number | null>;
+type Tool = { name: string; passesHardConstraints: boolean; scores: Scores };
+
+export function rank(tools: Tool[], weights: Record<string, number>) {
+  return tools
+    .filter((t) => t.passesHardConstraints)
+    .map((t) => {
+      const missing = Object.keys(weights).filter((g) => t.scores[g] == null);
+      const total = Object.entries(weights).reduce(
+        (sum, [gate, w]) => sum + w * (t.scores[gate] ?? 0),
+        0,
+      );
+      return { name: t.name, total, missing };
+    })
+    .sort((a, b) => b.total - a.total);
+}
+```
+
+A tool with entries in `missing` should not win on a total alone. Go and collect the missing evidence first.
+
+## How do I run a one-week trial that tells me something?
+
+Scoring on paper narrows the field to two. A trial decides between them. A good trial is short, uses real traffic and has pass conditions written in advance.
+
+![A seven-day timeline with the same agent traffic fanned out to two tools in parallel, with checkpoints on day one for setup, day three for the failed-run test, day five for the cost question, and day seven for the decision meeting](/media/how-to-choose-ai-agent-monitoring-tool-trial.svg)
+
+1. **Day one: instrument once.** Use {% highlight %}OpenTelemetry if both tools accept it{% /highlight %}, so you send the same spans to both and the comparison is about the tool, not your instrumentation.
+2. **Day three: the failed-run test.** Pick a real failed run. Have someone who did not build the agent find the failing step in each tool, and time them.
+3. **Day five: the cost question.** Ask each tool for the most expensive run last week and the cost by tenant or feature. Compare against your provider invoice.
+4. **Day seven: the decision.** Review the scores against the weights you set at the start.
+
+Record friction, not only results. How long did setup take? Were the docs accurate? Did the tool lose spans? These cost you time every week afterwards.
+
+{% highlight %}Run both tools on the same traffic{% /highlight %}, because comparing one tool on yesterday's traffic with another on today's confuses the tool with the day.
+
+### What a trial cannot tell you
+
+A week shows you usability and data quality. It cannot show how a vendor treats you during an outage, how pricing changes over a year, or how the tool behaves at ten times your volume. For those, read the vendor's status history and changelog, and ask sales or support direct questions about limits.
+
+## What mistakes make teams choose badly?
+
+Most bad selections come from {% highlight %}a small set of repeatable mistakes{% /highlight %}. Each has a cheap guard.
+
+| Mistake | What it looks like | Guard |
+| --- | --- | --- |
+| Feature-first comparison | A grid of ticks with no weights | Write the one-sentence problem first |
+| Demo-driven choice | The best presenter wins | Score only what the trial showed |
+| Ignoring operations cost | "Free" self-hosting chosen with no on-call plan | Add staffing time to the price |
+| Comparing unlike units | Price per unit set against price per span | Convert everything to your volume |
+| Skipping the exit test | Locked-in proprietary instrumentation | Prefer standard ingestion, or document the rewrite cost |
+| Trial on toy data | Great results on a happy-path demo | Use real failed runs |
+
+There is also a social mistake: choosing alone. The people who will use the tool during an incident should take part in the failed-run test, because the best tool for the author of the agent is not always the best for the person on call.
+
+## What are the limits of this checklist?
+
+This guide has boundaries, and stating them is part of choosing well.
+
+It does not rank products. It deliberately describes categories and billing shapes, because specific features and prices change and a ranking would go stale. The comparison pages carry dates for that reason, and you should re-read vendors' own pages before you decide.
+
+It does not replace security review. Monitoring tools receive prompts, tool arguments and model outputs, which can contain personal or confidential data. Before sending production data to any tool, check redaction, access control, retention and where data is processed. A tool that passes every gate here can still fail your security review.
+
+It does not cover evaluation depth. Scoring quality, building datasets and release gates are a topic of their own, and the right tool for them may differ from the right tool for monitoring. If evaluation is your primary need, weight it as a gate of its own.
+
+It is written by a vendor. The publisher of this blog sells one of the products in this space. The checklist is built so that it can rule that product out, and the self-hosting gate does, but you should weigh that interest when you read any vendor-published comparison, including this one.
+
+{% editorial-panel eyebrow="Decision room" title="Pick the tool that passes your hard gates and wins your weighted trial." body="Write the problem sentence, mark hard constraints, set weights, trial two tools on the same traffic and record friction. If the team can explain the choice in those four steps, the choice is defensible even if it later changes." tone="paper" /%}
+
+## What should I do this week?
+
+Turn the checklist into an action list you can finish in a week.
+
+- [ ] Write the one-sentence problem the tool must solve.
+- [ ] List your hard constraints: hosting, region, language, framework.
+- [ ] Sort candidate tools into categories and remove any that fail a hard constraint.
+- [ ] Measure your weekly spans, traces or requests and convert each vendor's billing unit to it.
+- [ ] Agree gate weights before looking at any scores.
+- [ ] Instrument once with OpenTelemetry where possible and send the same traffic to two tools.
+- [ ] Run the failed-run test with someone who did not build the agent.
+- [ ] Ask each tool for your most expensive run and compare it against the provider invoice.
+- [ ] Record the exit cost: what you would rewrite to leave.
+- [ ] Decide, write down why, and set a date to re-check.
+
+Finish by reviewing the decision on a schedule, for example at your next quarterly planning, because volumes, frameworks and pricing all move. A tool that was right for ten thousand spans a month may not be right at ten million, and the exit-cost note you wrote on day seven is what makes that review cheap.
+
+## Frequently asked questions
+
+{% faq-item question="What is the most important thing to check when choosing an AI agent monitoring tool?" answer="Whether it can show one real failed run end to end, with model calls and tool calls in order and their inputs and outputs. If someone who did not build the agent can find the failing step in minutes, trace depth is adequate. Everything else, including cost and pricing, matters only after that basic debugging job works." /%}
+{% faq-item question="Should I self-host or use a managed platform?" answer="It depends on three separate things: whether your data must stay in your network or a region, whether you want to operate the system, and whether you need the source. Self-hosting gives control and costs operational effort. A managed platform removes the servers and moves hosting choices to the vendor. Many open-source platforms also offer a hosted cloud, so the two options are not always exclusive." /%}
+{% faq-item question="How do I compare pricing when vendors count different things?" answer="Measure your own weekly volume of spans, traces or requests, including retries and tool calls, then convert each vendor's billing unit to that measurement. A unit, a trace and a span are not the same, so a price per unit cannot be compared with a price per span directly. Add seats, retention and any self-hosting operations cost before you compare totals." /%}
+{% faq-item question="Do I need a proprietary SDK, or is OpenTelemetry enough?" answer="Several products accept OpenTelemetry over OTLP, and Uncoil does too, so standard instrumentation can often be enough and keeps switching cheap. A vendor SDK can add convenience for a specific framework or language. Check that any SDK supports your language and framework, and ask what you would have to rewrite if you left." /%}
+{% faq-item question="How long should a trial of a monitoring tool last?" answer="About a week is enough to compare two tools if you use real traffic and agree the pass conditions beforehand. Send the same spans to both, run a failed-run test and a cost question, and record setup friction. A trial cannot show behaviour at much higher volume or during a vendor outage, so check status history and limits separately." /%}
